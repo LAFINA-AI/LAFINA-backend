@@ -1,0 +1,24 @@
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# Python bytecode & virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# Test & linter caches
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Vercel local state
+.vercel/

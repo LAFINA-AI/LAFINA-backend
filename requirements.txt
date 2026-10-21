@@ -1,0 +1,32 @@
+fastapi>=0.110.0
+uvicorn[standard]>=0.28.0
+sqlalchemy[asyncio]>=2.0.28
+alembic>=1.13.1
+asyncpg>=0.29.0
+pydantic-settings>=2.2.1
+pwdlib[argon2]>=0.2.0
+pyjwt[crypto]>=2.8.0
+# Imported directly by config.py and gmail_crypto.py, not only through
+# pyjwt's crypto extra, so it is named here rather than left transitive.
+cryptography>=42.0.0
+httpx>=0.27.0
+argon2-cffi>=23.1.0
+# PDF text extraction for flashcard generation. Pulls in pdfminer.six,
+# Pillow and pypdfium2, all of which ship Linux wheels.
+pdfplumber>=0.11.0
+# Writing the files the chat assistant generates: PDF, Excel, Word and
+# PowerPoint. All four are pure Python or ship Linux wheels.
+reportlab>=4.2
+openpyxl>=3.1
+python-docx>=1.1
+python-pptx>=1.0
+# Text recognition for scanned PDFs is deliberately NOT here: pytesseract
+# drives the Tesseract program, which Render's Python runtime cannot
+# install. Its import is optional at runtime. See `[ocr]` in pyproject.toml.
+sqladmin>=0.20.0
+itsdangerous>=2.2.0
+pytest>=8.1.1
+pytest-asyncio>=0.23.5
+pytest-cov>=4.1.0
+ruff>=0.3.2
+aiosqlite>=0.20.0

@@ -11,9 +11,9 @@ from app.models.account import Account
 from app.models.session import AuthSession
 from app.models.recovery import RecoveryCode
 from app.security.auth import (
-    hash_password, verify_password, create_access_token, generate_refresh_token,
-    hash_token, get_current_user_and_session, normalize_email, validate_password_strength,
-    dummy_password_hash,
+    hash_password, verify_password, needs_password_rehash, create_access_token,
+    generate_refresh_token, hash_token, get_current_user_and_session,
+    normalize_email, validate_password_strength, dummy_password_hash,
 )
 from app.security import login_throttle
 
@@ -155,6 +155,9 @@ async def login(req: LoginRequest, request: Request, db: AsyncSession = Depends(
 
     if not account.is_active:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is disabled.")
+
+    if needs_password_rehash(account.password_hash):
+        account.password_hash = hash_password(req.password)
 
     raw_refresh = generate_refresh_token()
     refresh_hash = hash_token(raw_refresh)

@@ -22,3 +22,5 @@ htmlcov/
 
 # Vercel local state
 .vercel/
+
+.vercel

@@ -62,7 +62,36 @@ def dummy_password_hash() -> str:
     return _dummy_password_hash
 
 
+_LEGACY_CLIENT_SALT_PREFIX = "lafina_salt_key_"
+
+
+def _legacy_client_sha256(password: str) -> str:
+    """Compute the SHA-256 hash format used by local SQLite client accounts."""
+    salted = _LEGACY_CLIENT_SALT_PREFIX + password
+    raw_bytes = bytes(ord(ch) & 0xFF for ch in salted)
+    return hashlib.sha256(raw_bytes).hexdigest()
+
+
+def needs_password_rehash(password_hash: str) -> bool:
+    """Return True if a stored hash is a migrated client hash or needs Argon2 upgrade."""
+    if not password_hash.startswith("$argon2"):
+        return True
+    try:
+        return ph.check_needs_rehash(password_hash)
+    except Exception:
+        return False
+
+
 def verify_password(password: str, password_hash: str) -> bool:
+    if password_hash.startswith("sha256$"):
+        expected = password_hash[len("sha256$"):]
+        utf8_digest = hashlib.sha256(
+            (_LEGACY_CLIENT_SALT_PREFIX + password).encode("utf-8")
+        ).hexdigest()
+        js_digest = _legacy_client_sha256(password)
+        return secrets.compare_digest(expected, utf8_digest) or secrets.compare_digest(
+            expected, js_digest
+        )
     try:
         return ph.verify(password_hash, password)
     except VerifyMismatchError:

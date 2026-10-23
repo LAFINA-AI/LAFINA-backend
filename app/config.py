@@ -214,10 +214,29 @@ class Settings(BaseSettings):
         "administrator", "letmein123", "welcome123", "changeme123", "lafina12345"
     }
 
+    def _is_placeholder_url(self, url: str | None) -> bool:
+        if not url:
+            return True
+        u = url.lower()
+        return any(
+            placeholder in u
+            for placeholder in (
+                "neon_user",
+                "neon_password",
+                "ep-example",
+                "render_db_user",
+                "render_internal_db_host",
+            )
+        )
+
     def get_async_database_url(self) -> str:
         """Return the normalized application DATABASE_URL (pooled on Neon)."""
         raw = self.DATABASE_URL
-        if (not raw or raw == _DEFAULT_LOCAL_DB_URL) and self.POSTGRES_URL:
+        if (
+            not raw
+            or raw == _DEFAULT_LOCAL_DB_URL
+            or self._is_placeholder_url(raw)
+        ) and self.POSTGRES_URL and not self._is_placeholder_url(self.POSTGRES_URL):
             raw = self.POSTGRES_URL
         return normalize_database_url(raw)
 
@@ -228,7 +247,15 @@ class Settings(BaseSettings):
         connection (`DATABASE_URL_UNPOOLED` / `POSTGRES_URL_NON_POOLING`) rather
         than the PgBouncer `-pooler` endpoint.
         """
-        raw = self.DATABASE_URL_UNPOOLED or self.POSTGRES_URL_NON_POOLING
+        raw = self.DATABASE_URL_UNPOOLED
+        if self._is_placeholder_url(raw):
+            raw = None
+        if (
+            not raw
+            and self.POSTGRES_URL_NON_POOLING
+            and not self._is_placeholder_url(self.POSTGRES_URL_NON_POOLING)
+        ):
+            raw = self.POSTGRES_URL_NON_POOLING
         if raw:
             return normalize_database_url(raw)
         return self.get_async_database_url()

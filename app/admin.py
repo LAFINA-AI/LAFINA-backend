@@ -47,7 +47,7 @@ class AdminAuth(AuthenticationBackend):
             account = res.scalar_one_or_none()
 
             # Require active account with admin role and valid password
-            if not account or not account.is_active or account.role != "admin":
+            if not account or not account.is_active or (account.role != "admin" and account.system_role != "admin"):
                 return False
 
             if not verify_password(password, account.password_hash):
@@ -79,7 +79,7 @@ class AdminAuth(AuthenticationBackend):
             res = await db.execute(stmt)
             account = res.scalar_one_or_none()
 
-            if not account or not account.is_active or account.role != "admin":
+            if not account or not account.is_active or (account.role != "admin" and account.system_role != "admin"):
                 request.session.clear()
                 return False
 

@@ -4,6 +4,8 @@ sqlalchemy[asyncio]>=2.0.28
 alembic>=1.13.1
 asyncpg>=0.29.0
 pydantic-settings>=2.2.1
+email-validator>=2.1.0
+python-multipart>=0.0.9
 pwdlib[argon2]>=0.2.0
 pyjwt[crypto]>=2.8.0
 # Imported directly by config.py and gmail_crypto.py, not only through

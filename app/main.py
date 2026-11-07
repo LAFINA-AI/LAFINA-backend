@@ -9,13 +9,13 @@ import app.models  # noqa: F401
 from app.api.v1 import auth, sync, ai, meetings, meeting_notes
 from app.admin import setup_admin
 from app.clients.deepseek import DeepSeekClient
-from app.clients.gemini_tts import GeminiTtsClient
+from app.clients.elevenlabs_tts import ElevenLabsTtsClient
 from app.clients.pinecone_index import PineconeIndexClient
 from app.services.handbook_rag import HandbookRetriever
 
 settings = get_settings()
 deepseek_client = DeepSeekClient(settings=settings)
-gemini_tts_client = GeminiTtsClient(settings=settings)
+elevenlabs_tts_client = ElevenLabsTtsClient(settings=settings)
 handbook_retriever = HandbookRetriever(settings, PineconeIndexClient(settings))
 
 
@@ -23,10 +23,10 @@ handbook_retriever = HandbookRetriever(settings, PineconeIndexClient(settings))
 async def lifespan(app: FastAPI):
     # Initialize HTTP client pools
     await deepseek_client.start()
-    await gemini_tts_client.start()
+    await elevenlabs_tts_client.start()
     await handbook_retriever.start()
     app.state.deepseek_client = deepseek_client
-    app.state.gemini_tts_client = gemini_tts_client
+    app.state.elevenlabs_tts_client = elevenlabs_tts_client
     app.state.handbook_retriever = handbook_retriever
     if not settings.is_handbook_configured():
         print(
@@ -53,7 +53,7 @@ async def lifespan(app: FastAPI):
             print(f"[Warning] Startup initialization note: {e}")
     yield
     await deepseek_client.close()
-    await gemini_tts_client.close()
+    await elevenlabs_tts_client.close()
     await handbook_retriever.close()
     await engine.dispose()
 
@@ -68,7 +68,7 @@ app = FastAPI(
 )
 
 app.state.deepseek_client = deepseek_client
-app.state.gemini_tts_client = gemini_tts_client
+app.state.elevenlabs_tts_client = elevenlabs_tts_client
 app.state.handbook_retriever = handbook_retriever
 
 # Paths that carry an uploaded document rather than a record, and so are held

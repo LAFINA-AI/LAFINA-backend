@@ -173,6 +173,12 @@ class Settings(BaseSettings):
     DEEPSEEK_TIMEOUT_SECONDS: float = 120.0
 
     # Gemini TTS Configuration
+    # Server-held ElevenLabs credentials; Gemini speech is retired by the TTS routes.
+    ELEVENLABS_API_KEY: SecretStr | None = None
+    ELEVENLABS_VOICE_ID: str = "JBFqnCBsd6RMkjVDRZzb"
+    ELEVENLABS_MODEL_ID: str = "eleven_flash_v2_5"
+    ELEVENLABS_MAX_CHARACTERS_PER_PROCESS: int = 20000
+
     GEMINI_API_KEY: SecretStr | None = None
     GEMINI_BASE_URL: str = "https://generativelanguage.googleapis.com"
     GEMINI_TTS_MODEL: str = "gemini-3.1-flash-tts-preview"

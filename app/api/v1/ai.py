@@ -27,7 +27,7 @@ from app.clients.deepseek import (
     DeepSeekError,
     DeepSeekMalformedResponseError,
 )
-from app.clients.gemini_tts import GeminiTtsClient, GeminiTtsError
+from app.clients.elevenlabs_tts import ElevenLabsTtsClient, ElevenLabsTtsError
 from app.services.flashcards import (
     FLASHCARD_SYSTEM_PROMPT,
     Flashcard,
@@ -95,11 +95,11 @@ def get_deepseek_client(request: Request) -> DeepSeekClient:
     return client
 
 
-def get_gemini_tts_client(request: Request) -> GeminiTtsClient:
-    """Dependency helper providing the application-scoped GeminiTtsClient."""
-    client: GeminiTtsClient | None = getattr(request.app.state, "gemini_tts_client", None)
+def get_elevenlabs_tts_client(request: Request) -> ElevenLabsTtsClient:
+    """Dependency helper providing the application-scoped ElevenLabsTtsClient."""
+    client: ElevenLabsTtsClient | None = getattr(request.app.state, "elevenlabs_tts_client", None)
     if client is None:
-        return GeminiTtsClient(settings=settings)
+        return ElevenLabsTtsClient(settings=settings)
     return client
 
 
@@ -174,14 +174,16 @@ class AIChatResponse(BaseModel):
 
 
 class AITtsRequest(BaseModel):
+    provider: Literal["elevenlabs"] = "elevenlabs"
     requestId: str = Field(default_factory=lambda: str(uuid.uuid4()))
     text: str = Field(..., min_length=1, max_length=512)
 
 
 class AITtsResponse(BaseModel):
+    provider: Literal["elevenlabs"] = "elevenlabs"
     requestId: str
     audioBase64: str
-    mimeType: str = "audio/wav"
+    mimeType: str = "audio/mpeg"
     model: str
     voice: str
     createdAt: str
@@ -333,12 +335,23 @@ async def handbook_status(
     )
 
 
+@router.get("/tts/capabilities")
+async def tts_capabilities(
+    auth_data: Annotated[tuple[Account, AuthSession], Depends(get_current_user_and_session)],
+    elevenlabs_tts: ElevenLabsTtsClient = Depends(get_elevenlabs_tts_client),
+):
+    account, _ = auth_data
+    if not has_tts_access(account):
+        raise HTTPException(status_code=403, detail="Online speech requires student_pro access.")
+    return {"provider": "elevenlabs", "enabled": elevenlabs_tts.configured, "mimeType": "audio/mpeg"}
+
+
 @router.post("/tts", response_model=AITtsResponse)
 async def tts_proxy(
     req: AITtsRequest,
     auth_data: Annotated[tuple[Account, AuthSession], Depends(get_current_user_and_session)],
     db: AsyncSession = Depends(get_db),
-    gemini_tts: GeminiTtsClient = Depends(get_gemini_tts_client)
+    elevenlabs_tts: ElevenLabsTtsClient = Depends(get_elevenlabs_tts_client)
 ):
     account, _ = auth_data
     owner_id = account.id
@@ -347,7 +360,7 @@ async def tts_proxy(
     if not has_tts_access(account):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Gemini TTS requires a student_pro subscription. Please upgrade your account."
+            detail="ElevenLabs TTS requires a student_pro subscription. Please upgrade your account."
         )
 
     trimmed_text = req.text.strip()
@@ -389,11 +402,11 @@ async def tts_proxy(
         )
 
     try:
-        audio_base64, usage_data = await gemini_tts.synthesize_speech(
+        audio_base64, usage_data = await elevenlabs_tts.synthesize_speech(
             text=trimmed_text,
             request_id=req.requestId
         )
-    except GeminiTtsError as err:
+    except ElevenLabsTtsError as err:
         raise HTTPException(
             status_code=err.status_code,
             detail=err.message
@@ -412,9 +425,9 @@ async def tts_proxy(
     return AITtsResponse(
         requestId=req.requestId,
         audioBase64=audio_base64,
-        mimeType="audio/wav",
-        model=settings.GEMINI_TTS_MODEL,
-        voice=settings.GEMINI_TTS_VOICE,
+        mimeType="audio/mpeg",
+        model=settings.ELEVENLABS_MODEL_ID,
+        voice=settings.ELEVENLABS_VOICE_ID,
         createdAt=now_str
     )
 

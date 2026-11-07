@@ -202,29 +202,8 @@ async def test_online_ai_proxy(async_client: AsyncClient):
     token = reg_res.json()["access_token"]
     headers = {"Authorization": f"Bearer {token}"}
 
-    # 2. Student role attempt should be rejected with 403 Forbidden before provider call
-    student_chat_res = await async_client.post("/v1/ai/chat", headers=headers, json={
-        "requestId": "req-001",
-        "messages": [
-            {"role": "user", "content": "How do I organize my study schedule for midterms?"}
-        ]
-    })
-    assert student_chat_res.status_code == 403
-    assert "student_pro" in student_chat_res.json()["detail"]
-
-    # 3. Promote account role to student_pro in DB and log in to get updated JWT claim
-    async with TestingSessionLocal() as db:
-        stmt = select(Account).where(Account.email == "ai_user@ustp.edu.ph")
-        acc = (await db.execute(stmt)).scalar_one()
-        acc.role = "student_pro"
-        await db.commit()
-
-    login_res = await async_client.post("/v1/auth/login", json={
-        "email": "ai_user@ustp.edu.ph",
-        "password": password
-    })
-    pro_token = login_res.json()["access_token"]
-    pro_headers = {"Authorization": f"Bearer {pro_token}"}
+    # Ordinary signed-in students use the same chat route without plan promotion.
+    pro_headers = headers
 
     # 4. Without configured DEEPSEEK_API_KEY in dev environment, should return 503 Service Unavailable
     unconfig_settings = Settings(ENVIRONMENT="development", DEEPSEEK_API_KEY=None)
@@ -271,7 +250,7 @@ async def test_online_ai_proxy(async_client: AsyncClient):
     chat_data = pro_chat_res.json()
     assert chat_data["requestId"] == "req-002"
     assert "Prioritize weak subjects" in chat_data["reply"]
-    assert chat_data["model"] == "deepseek-v4-flash"
+    assert chat_data["model"] == "deepseek-flash"
     assert chat_data["usage"]["total_tokens"] == 25
 
     # Verify AIUsage record created in DB

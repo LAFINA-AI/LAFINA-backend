@@ -19,6 +19,7 @@ from app.models.ai_usage import AIUsage
 from app.security.auth import get_current_user_and_session
 from app.services.capabilities import (
     has_online_ai_access,
+    has_chat_access,
     has_tts_access,
     is_student_pro,
 )
@@ -82,7 +83,7 @@ LAFINA_SYSTEM_INSTRUCTION = (
     "Your primary function is helping students organize their academic life: scheduling classes, study sessions, midterm exams, "
     "assignments, reminders, and time blocks, while also answering academic and general questions. "
     "Rule 1: NEVER refuse, decline, or lecture a user about their requested schedule times (including 3 AM, late night, or early morning hours). Always accept and confirm any requested time, date, or duration without judgment. "
-    "Rule 2: When a user asks you to schedule, remind, or plan a task, confirm warmly as LAFINA that the schedule item has been created with the exact title, date, time, and duration requested."
+    "Rule 2: You cannot create or modify local schedules. Never claim a task, reminder or event was saved. Ask the student to use the app scheduling controls when a durable change is needed. "
     "Rule 3: Do not use emojis in the chat"
 )
 
@@ -164,6 +165,8 @@ class HandbookSource(BaseModel):
 
 
 class AIChatResponse(BaseModel):
+    provider: Literal["deepseek"] = "deepseek"
+    usedHandbook: bool = False
     requestId: str
     reply: str
     model: str
@@ -177,6 +180,7 @@ class AITtsRequest(BaseModel):
     provider: Literal["elevenlabs"] = "elevenlabs"
     requestId: str = Field(default_factory=lambda: str(uuid.uuid4()))
     text: str = Field(..., min_length=1, max_length=512)
+    voiceId: str | None = Field(default=None, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
 
 
 class AITtsResponse(BaseModel):
@@ -201,10 +205,10 @@ async def chat_proxy(
     owner_id = account.id
 
     # Enforce role-based access for Online AI from live DB Account
-    if not has_online_ai_access(account):
+    if not has_chat_access(account):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Online AI requires a student_pro subscription. Please upgrade your account."
+            detail="Sign in with an active account to use online chat."
         )
 
     now = datetime.now(timezone.utc)
@@ -293,6 +297,7 @@ async def chat_proxy(
         usage=usage_data,
         createdAt=now_str,
         sources=[HandbookSource(**passage.as_source()) for passage in passages],
+        usedHandbook=bool(passages),
     )
 
 
@@ -342,8 +347,27 @@ async def tts_capabilities(
 ):
     account, _ = auth_data
     if not has_tts_access(account):
-        raise HTTPException(status_code=403, detail="Online speech requires student_pro access.")
+        raise HTTPException(status_code=403, detail="Sign in with an active account to use online speech.")
     return {"provider": "elevenlabs", "enabled": elevenlabs_tts.configured, "mimeType": "audio/mpeg"}
+
+
+@router.get("/tts/voices")
+async def tts_voices(
+    auth_data: Annotated[tuple[Account, AuthSession], Depends(get_current_user_and_session)],
+    elevenlabs_tts: ElevenLabsTtsClient = Depends(get_elevenlabs_tts_client),
+):
+    account, _ = auth_data
+    if not has_tts_access(account):
+        raise HTTPException(status_code=403, detail="An active account is required.")
+    try:
+        voices = await elevenlabs_tts.list_voices()
+    except ElevenLabsTtsError as err:
+        raise HTTPException(status_code=err.status_code, detail=err.message)
+    return {
+        "provider": "elevenlabs",
+        "defaultVoiceId": settings.ELEVENLABS_VOICE_ID,
+        "voices": voices,
+    }
 
 
 @router.post("/tts", response_model=AITtsResponse)
@@ -356,11 +380,11 @@ async def tts_proxy(
     account, _ = auth_data
     owner_id = account.id
 
-    # Enforce access for TTS from live DB Account (student_pro only)
+    # Enforce active-account access; authentication and quotas still apply.
     if not has_tts_access(account):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="ElevenLabs TTS requires a student_pro subscription. Please upgrade your account."
+            detail="Sign in with an active account to use online speech."
         )
 
     trimmed_text = req.text.strip()
@@ -404,7 +428,8 @@ async def tts_proxy(
     try:
         audio_base64, usage_data = await elevenlabs_tts.synthesize_speech(
             text=trimmed_text,
-            request_id=req.requestId
+            request_id=req.requestId,
+            voice_id=req.voiceId,
         )
     except ElevenLabsTtsError as err:
         raise HTTPException(
@@ -427,7 +452,7 @@ async def tts_proxy(
         audioBase64=audio_base64,
         mimeType="audio/mpeg",
         model=settings.ELEVENLABS_MODEL_ID,
-        voice=settings.ELEVENLABS_VOICE_ID,
+        voice=req.voiceId or settings.ELEVENLABS_VOICE_ID,
         createdAt=now_str
     )
 

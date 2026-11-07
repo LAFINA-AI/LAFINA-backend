@@ -37,9 +37,14 @@ def has_online_ai_access(account: Account) -> bool:
     return bool(account.is_active) and (is_student_pro(account) or is_admin(account))
 
 
+def has_chat_access(account: Account) -> bool:
+    """Authenticated active accounts may use conversational online AI."""
+    return bool(account.is_active)
+
+
 def has_tts_access(account: Account) -> bool:
-    """Cloud TTS is a Student Pro feature only (admins are deliberately excluded)."""
-    return is_student_pro(account)
+    """Authenticated active accounts may use online speech, within quotas."""
+    return bool(account.is_active)
 
 
 def resolve_account_capabilities(account: Account) -> CapabilityResolution:

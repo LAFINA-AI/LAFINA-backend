@@ -65,7 +65,7 @@ async def test_client_successful_chat_completion(caplog):
                 "id": "chatcmpl-123",
                 "object": "chat.completion",
                 "created": 1677858288,
-                "model": "deepseek-v4-flash",
+                "model": "deepseek-flash",
                 "choices": [
                     {
                         "index": 0,
@@ -104,7 +104,7 @@ async def test_client_successful_chat_completion(caplog):
     # Verify request parameters
     assert captured_request["url"] == "https://api.deepseek.com/chat/completions"
     assert captured_request["headers"]["authorization"] == "Bearer sk-valid-test-key-999"
-    assert captured_request["body"]["model"] == "deepseek-v4-flash"
+    assert captured_request["body"]["model"] == "deepseek-flash"
     assert captured_request["body"]["stream"] is False
     assert captured_request["body"]["thinking"] == {"type": "disabled"}
     assert captured_request["body"]["user"] == user_uuid

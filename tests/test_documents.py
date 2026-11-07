@@ -370,7 +370,7 @@ async def test_a_student_pro_gets_a_file(async_client: AsyncClient, fake_deepsee
 
     call = fake.calls[0]
     assert call["json_mode"] is True
-    assert call["model"] == "deepseek-v4-flash"
+    assert call["model"] == "deepseek-flash"
     # The conversation reaches the model after the system instruction.
     assert call["messages"][0]["role"] == "system"
     assert call["messages"][-1]["content"].startswith("Make me a PDF")

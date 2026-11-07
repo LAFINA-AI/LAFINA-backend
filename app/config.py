@@ -166,7 +166,7 @@ class Settings(BaseSettings):
     # DeepSeek API Configuration
     DEEPSEEK_API_KEY: SecretStr | None = None
     DEEPSEEK_BASE_URL: str = "https://api.deepseek.com"
-    DEEPSEEK_MODEL: str = "deepseek-v4-flash"
+    DEEPSEEK_MODEL: str = "deepseek-flash"
     # Flashcards need a model that follows a strict output shape over a long
     # reply, which is a different job from the conversational assistant.
     DEEPSEEK_FLASHCARD_MODEL: str = "deepseek-chat"
@@ -312,6 +312,9 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_deepseek_config(self) -> "Settings":
+        # Compatibility for the retired alias used by existing deployments.
+        if self.DEEPSEEK_MODEL == "deepseek-v4-flash":
+            self.DEEPSEEK_MODEL = "deepseek-flash"
         reason = self.get_deepseek_key_invalid_reason()
         if self.ENVIRONMENT == "production" and reason is not None:
             raise ValueError(

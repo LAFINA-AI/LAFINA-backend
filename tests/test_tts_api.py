@@ -34,8 +34,8 @@ async def test_tts_unauthenticated_returns_401(async_client: AsyncClient):
 async def test_tts_role_enforcement(async_client: AsyncClient):
     """
     Role enforcement test:
-    - student -> 403 Forbidden
-    - admin -> 403 Forbidden
+    - student -> 200 OK
+    - admin -> 200 OK
     - student_pro -> 200 OK
     """
     app.state.elevenlabs_tts_client = create_mock_elevenlabs_client()
@@ -51,8 +51,7 @@ async def test_tts_role_enforcement(async_client: AsyncClient):
         json={"text": "Hello world"},
         headers={"Authorization": f"Bearer {token_student}"},
     )
-    assert res_student.status_code == 403
-    assert "student_pro" in res_student.json()["detail"]
+    assert res_student.status_code == 200
 
     # 2. Promote user role in DB to admin -> must return 403 for TTS
     async with TestingSessionLocal() as db:
@@ -66,7 +65,7 @@ async def test_tts_role_enforcement(async_client: AsyncClient):
         json={"text": "Hello world"},
         headers={"Authorization": f"Bearer {token_student}"},
     )
-    assert res_admin.status_code == 403
+    assert res_admin.status_code == 200
 
     # 3. Promote user role in DB to student_pro -> must succeed (200)
     async with TestingSessionLocal() as db:
@@ -203,7 +202,8 @@ async def test_elevenlabs_capability_requires_auth_and_entitlement(async_client:
         json={"email": "elevenlabs_capability@ustp.edu.ph", "password": "SyntheticPassword123!"},
     )
     headers = {"Authorization": "Bearer " + registration.json()["access_token"]}
-    assert (await async_client.get("/v1/ai/tts/capabilities", headers=headers)).status_code == 403
+    app.state.elevenlabs_tts_client = create_mock_elevenlabs_client()
+    assert (await async_client.get("/v1/ai/tts/capabilities", headers=headers)).status_code == 200
     async with TestingSessionLocal() as db:
         account = (
             await db.execute(

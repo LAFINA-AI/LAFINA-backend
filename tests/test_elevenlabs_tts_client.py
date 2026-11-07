@@ -87,3 +87,10 @@ async def test_budget_and_input_validation_before_network():
         with pytest.raises(ElevenLabsTtsError) as invalid:
             await client.synthesize_speech("x" * 513, "r2")
         assert invalid.value.status_code == 400
+
+
+def test_fast_model_only_for_low_latency_and_only_when_set():
+    fast = SimpleNamespace(**vars(settings()), ELEVENLABS_FAST_MODEL_ID="eleven_v4_turbo")
+    assert ElevenLabsTtsClient(fast).model_for("low") == "eleven_v4_turbo"
+    assert ElevenLabsTtsClient(fast).model_for("standard") == "eleven_flash_v2_5"
+    assert ElevenLabsTtsClient(settings()).model_for("low") == "eleven_flash_v2_5"

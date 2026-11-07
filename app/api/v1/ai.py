@@ -186,6 +186,8 @@ class AITtsRequest(BaseModel):
     requestId: str = Field(default_factory=lambda: str(uuid.uuid4()))
     text: str = Field(..., min_length=1, max_length=512)
     voiceId: str | None = Field(default=None, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
+    # "low": a spoken conversation, answered with the fastest voice model.
+    latency: Literal["standard", "low"] = "standard"
 
 
 class AITtsResponse(BaseModel):
@@ -528,6 +530,7 @@ async def tts_proxy(
             text=trimmed_text,
             request_id=req.requestId,
             voice_id=req.voiceId,
+            latency=req.latency,
         )
     except ElevenLabsTtsError as err:
         raise HTTPException(
@@ -549,7 +552,7 @@ async def tts_proxy(
         requestId=req.requestId,
         audioBase64=audio_base64,
         mimeType="audio/mpeg",
-        model=settings.ELEVENLABS_MODEL_ID,
+        model=usage_data.get("model", settings.ELEVENLABS_MODEL_ID),
         voice=req.voiceId or settings.ELEVENLABS_VOICE_ID,
         createdAt=now_str
     )

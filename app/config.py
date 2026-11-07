@@ -178,6 +178,8 @@ class Settings(BaseSettings):
     # Camille, a young Filipina conversational voice. Students can pick others.
     ELEVENLABS_VOICE_ID: str = "BtcCEANLn920ZIoN9grW"
     ELEVENLABS_MODEL_ID: str = "eleven_v4"
+    # Voice-mode conversation: about 3x faster than eleven_v4, Filipino supported.
+    ELEVENLABS_FAST_MODEL_ID: str = "eleven_v4_turbo"
     ELEVENLABS_MAX_CHARACTERS_PER_PROCESS: int = 20000
 
     GEMINI_API_KEY: SecretStr | None = None

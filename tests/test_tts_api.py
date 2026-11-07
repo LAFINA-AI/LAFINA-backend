@@ -1,3 +1,4 @@
+import json
 import httpx
 import pytest
 from httpx import AsyncClient, MockTransport, Response
@@ -217,3 +218,40 @@ async def test_elevenlabs_capability_requires_auth_and_entitlement(async_client:
     assert response.status_code == 200
     assert response.json() == {"provider": "elevenlabs", "enabled": True, "mimeType": "audio/mpeg"}
     assert "synthetic-elevenlabs-key" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_tts_low_latency_uses_fast_model_and_smaller_audio(async_client: AsyncClient):
+    """Voice mode asks for latency "low": the fast model and a smaller MP3.
+    Requests without it (older apps, reminder calls) keep eleven_v4 at 128 kbps."""
+    seen = []
+
+    def handler(request: httpx.Request) -> Response:
+        seen.append(
+            (request.url.params["output_format"], json.loads(request.content)["model_id"])
+        )
+        return Response(200, content=b"synthetic-mp3-audio", headers={"Content-Type": "audio/mpeg"})
+
+    settings = Settings(ENVIRONMENT="development", ELEVENLABS_API_KEY="synthetic-elevenlabs-key")
+    app.state.elevenlabs_tts_client = ElevenLabsTtsClient(
+        settings=settings, client=httpx.AsyncClient(transport=MockTransport(handler))
+    )
+    reg = await async_client.post(
+        "/v1/auth/register", json={"email": "fast_voice@ustp.edu.ph", "password": "Password123!"}
+    )
+    headers = {"Authorization": f"Bearer {reg.json()['access_token']}"}
+
+    fast = await async_client.post(
+        "/v1/ai/tts", json={"text": "Hey Lem!", "latency": "low"}, headers=headers
+    )
+    assert fast.status_code == 200
+    assert fast.json()["model"] == "eleven_v4_turbo"
+    standard = await async_client.post("/v1/ai/tts", json={"text": "Hey Lem!"}, headers=headers)
+    assert standard.status_code == 200
+    assert standard.json()["model"] == "eleven_v4"
+    assert seen == [("mp3_44100_64", "eleven_v4_turbo"), ("mp3_44100_128", "eleven_v4")]
+
+    bad = await async_client.post(
+        "/v1/ai/tts", json={"text": "Hey", "latency": "instant"}, headers=headers
+    )
+    assert bad.status_code == 422

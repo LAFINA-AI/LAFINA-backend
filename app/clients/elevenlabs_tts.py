@@ -129,7 +129,21 @@ class ElevenLabsTtsClient:
             except (httpx.HTTPError, ValueError):
                 raise ElevenLabsTtsError("Voice catalogue is unavailable. Try again.") from None
 
-    async def synthesize_speech(self, text: str, request_id: str, voice_id: str | None = None):
+    def model_for(self, latency: str = "standard") -> str:
+        """`low` (a spoken conversation) uses the fast model when one is set."""
+        if latency == "low":
+            fast = getattr(self.settings, "ELEVENLABS_FAST_MODEL_ID", None)
+            if fast:
+                return fast
+        return self.settings.ELEVENLABS_MODEL_ID
+
+    async def synthesize_speech(
+        self,
+        text: str,
+        request_id: str,
+        voice_id: str | None = None,
+        latency: str = "standard",
+    ):
         if not self.configured:
             raise ElevenLabsTtsError("ElevenLabs speech is not configured.", 503)
         if not text.strip() or len(text) > 512:
@@ -155,6 +169,7 @@ class ElevenLabsTtsClient:
         self.used_characters += len(text)
         self.requests[request_id] = now
         await self.start()
+        model = self.model_for(latency)
         audio = bytearray()
         try:
             async with asyncio.timeout(14):
@@ -162,11 +177,13 @@ class ElevenLabsTtsClient:
                     "POST",
                     "https://api.elevenlabs.io/v1/text-to-speech/"
                     + quote(selected_voice, safe="")
-                    + "?output_format=mp3_44100_128",
+                    + "?output_format="
+                    # Half the bytes for conversation; speech still sounds clear.
+                    + ("mp3_44100_64" if latency == "low" else "mp3_44100_128"),
                     headers={
                         "xi-api-key": self.settings.ELEVENLABS_API_KEY.get_secret_value().strip()
                     },
-                    json={"text": text, "model_id": self.settings.ELEVENLABS_MODEL_ID},
+                    json={"text": text, "model_id": model},
                     timeout=12,
                 ) as response:
                     if response.status_code == 429:
@@ -188,6 +205,7 @@ class ElevenLabsTtsClient:
             return base64.b64encode(audio).decode("ascii"), {
                 "prompt_tokens": len(text),
                 "completion_tokens": 0,
+                "model": model,
             }
         except (TimeoutError, httpx.TimeoutException):
             raise ElevenLabsTtsError("ElevenLabs speech timed out.", 504) from None

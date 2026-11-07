@@ -7,7 +7,7 @@ from sqlalchemy import select
 
 from app.api.v1.ai import get_deepseek_client
 from app.clients.deepseek import DeepSeekClient
-from app.clients.elevenlabs_tts import ElevenLabsTtsClient, ElevenLabsTtsError
+from app.clients.elevenlabs_tts import FILIPINA_VOICES, ElevenLabsTtsClient, ElevenLabsTtsError
 from app.config import Settings
 from app.main import app
 from app.models.account import Account
@@ -61,7 +61,8 @@ async def test_all_active_signed_in_roles_can_choose_voice_and_chat(async_client
     headers = await signed_in(async_client, role)
     catalogue = await async_client.get("/v1/ai/tts/voices", headers=headers)
     assert catalogue.status_code == 200
-    assert catalogue.json()["voices"] == [{"id": "voice_a", "name": "Alice"}, {"id": "voice_b", "name": "Bella"}]
+    filipina = [{"id": voice_id, "name": name, "language": "fil", "gender": "female"} for voice_id, name in FILIPINA_VOICES]
+    assert catalogue.json()["voices"] == filipina + [{"id": "voice_a", "name": "Alice"}, {"id": "voice_b", "name": "Bella"}]
     result = await async_client.post("/v1/ai/tts", headers=headers, json={"text": "Hello", "voiceId": "voice_b"})
     assert result.status_code == 200
     assert result.json()["voice"] == "voice_b"
@@ -120,3 +121,37 @@ def test_persona_prompt_is_conversational_and_honest():
     assert "Always introduce yourself" not in prompt
     assert "do not repeat the introduction" in prompt
     assert "Never claim a task, reminder or event was saved" in prompt
+
+
+async def test_filipina_voices_come_first_with_labels_and_need_no_catalogue_lookup():
+    seen = []
+
+    def transport(request):
+        seen.append(request)
+        if request.method == "GET":
+            return httpx.Response(200, json={"voices": [
+                {"voice_id": "zz_male", "name": "Adam", "labels": {"language": "en", "gender": "male"}},
+                {"voice_id": "fil_extra", "name": "Ate Lyn", "labels": {"language": "fil", "gender": "female"}},
+                {"voice_id": "BtcCEANLn920ZIoN9grW", "name": "Camille - Warm & Conversational, long account name", "labels": {"language": "fil"}},
+                {"voice_id": "odd", "name": "Odd", "labels": {"language": "<script>", "gender": 7}},
+            ], "has_more": False})
+        return httpx.Response(200, content=b"synthetic audio", headers={"content-type": "audio/mpeg"})
+
+    config = Settings(_env_file=None, ELEVENLABS_API_KEY="synthetic-key")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as http:
+        client = ElevenLabsTtsClient(config, http)
+        await client.synthesize_speech("Kumusta!", "req-1", voice_id="n6WaB3rOlZSC9y8yEPEz")
+        assert [r.method for r in seen] == ["POST"]  # featured voice: no catalogue call
+        assert json.loads(seen[0].content)["model_id"] == "eleven_v4"
+        voices = await client.list_voices()
+    names = [v["name"] for v in voices]
+    assert names[: len(FILIPINA_VOICES)] == [name for _, name in FILIPINA_VOICES]
+    assert names[len(FILIPINA_VOICES):] == ["Ate Lyn", "Adam", "Odd"]
+    assert voices[-1] == {"id": "odd", "name": "Odd"}  # unusable labels are dropped
+    assert {"id": "zz_male", "name": "Adam", "language": "en", "gender": "male"} in voices
+
+
+def test_default_voice_is_filipina_and_model_is_v4():
+    config = Settings(_env_file=None)
+    assert config.ELEVENLABS_MODEL_ID == "eleven_v4"
+    assert config.ELEVENLABS_VOICE_ID == FILIPINA_VOICES[0][0]

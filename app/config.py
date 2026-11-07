@@ -175,8 +175,9 @@ class Settings(BaseSettings):
     # Gemini TTS Configuration
     # Server-held ElevenLabs credentials; Gemini speech is retired by the TTS routes.
     ELEVENLABS_API_KEY: SecretStr | None = None
-    ELEVENLABS_VOICE_ID: str = "JBFqnCBsd6RMkjVDRZzb"
-    ELEVENLABS_MODEL_ID: str = "eleven_flash_v2_5"
+    # Camille, a young Filipina conversational voice. Students can pick others.
+    ELEVENLABS_VOICE_ID: str = "BtcCEANLn920ZIoN9grW"
+    ELEVENLABS_MODEL_ID: str = "eleven_v4"
     ELEVENLABS_MAX_CHARACTERS_PER_PROCESS: int = 20000
 
     GEMINI_API_KEY: SecretStr | None = None

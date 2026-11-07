@@ -83,7 +83,7 @@ async def test_tts_role_enforcement(async_client: AsyncClient):
     data = res_pro.json()
     assert "audioBase64" in data
     assert data["mimeType"] == "audio/mpeg"
-    assert data["voice"] == "JBFqnCBsd6RMkjVDRZzb"
+    assert data["voice"] == "BtcCEANLn920ZIoN9grW"
 
 
 @pytest.mark.asyncio

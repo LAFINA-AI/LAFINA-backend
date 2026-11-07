@@ -140,3 +140,57 @@ async def test_stream_shares_the_chat_quota(async_client, upstream, monkeypatch)
     assert (await async_client.post("/v1/ai/chat/stream", headers=headers, json=CHAT)).status_code == 200
     assert (await async_client.post("/v1/ai/chat/stream", headers=headers, json=CHAT)).status_code == 429
     assert len(upstream["requests"]) == 1
+
+
+async def test_text_is_not_held_back_while_usage_is_saved(async_client, upstream, monkeypatch):
+    """Saving the usage row must not hold the stream back: with a slow
+    database, DeepSeek would finish meanwhile and the student would get the
+    whole reply in one burst. Here the save can only finish once DeepSeek's
+    later pieces were consumed, which happens only if the stream runs while
+    the save is still waiting."""
+    import asyncio
+
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    later_pieces_read = asyncio.Event()
+
+    async def deepseek_pieces():
+        yield sse_body(delta("Hey"))
+        yield sse_body(delta(" there,"))
+        yield sse_body(delta(" Maria!"))
+        later_pieces_read.set()
+        yield sse_body(USAGE, "[DONE]")
+
+    upstream["response"] = httpx.Response(200, content=deepseek_pieces())
+    headers = await signed_in(async_client)
+
+    original_commit = AsyncSession.commit
+
+    async def slow_usage_commit(self):
+        if any(isinstance(row, AIUsage) for row in self.new):
+            await asyncio.wait_for(later_pieces_read.wait(), timeout=5)
+        return await original_commit(self)
+
+    monkeypatch.setattr(AsyncSession, "commit", slow_usage_commit)
+    response = await asyncio.wait_for(
+        async_client.post("/v1/ai/chat/stream", headers=headers, json=CHAT), timeout=10
+    )
+    assert response.status_code == 200
+    got = events(response)
+    assert "".join(e["text"] for e in got if e["type"] == "delta") == "Hey there, Maria!"
+    assert got[-1]["type"] == "done"
+    rows = await usage_rows()
+    assert len(rows) == 1
+    assert (rows[0].prompt_tokens, rows[0].completion_tokens) == (40, 6)
+
+
+async def test_quota_counts_minute_and_day_in_one_query(async_client, upstream, monkeypatch):
+    from app.api.v1 import ai
+
+    monkeypatch.setattr(ai.settings, "MAX_AI_REQUESTS_PER_DAY", 2)
+    headers = await signed_in(async_client)
+    for _ in range(2):
+        assert (await async_client.post("/v1/ai/chat/stream", headers=headers, json=CHAT)).status_code == 200
+    blocked = await async_client.post("/v1/ai/chat/stream", headers=headers, json=CHAT)
+    assert blocked.status_code == 429
+    assert "Daily" in blocked.json()["detail"]

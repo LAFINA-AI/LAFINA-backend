@@ -200,6 +200,24 @@ class AITtsResponse(BaseModel):
     createdAt: str
 
 
+async def _usage_counts(
+    db: AsyncSession, owner_id, request_type: str, now: datetime
+) -> tuple[int, int]:
+    """Requests of this type in the last minute and in the last 24 hours."""
+    one_min_ago = now - timedelta(minutes=1)
+    day_ago = now - timedelta(hours=24)
+    stmt = select(
+        func.count(AIUsage.id).filter(AIUsage.created_at >= one_min_ago),
+        func.count(AIUsage.id),
+    ).where(
+        AIUsage.owner_id == owner_id,
+        AIUsage.request_type == request_type,
+        AIUsage.created_at >= day_ago,
+    )
+    minute, day = (await db.execute(stmt)).one()
+    return minute or 0, day or 0
+
+
 async def _prepare_chat(
     req: AIChatRequest,
     account: Account,
@@ -226,28 +244,15 @@ async def _prepare_chat(
             detail="Total input messages character count exceeds limit of 8,000 characters."
         )
 
-    # Rate limiting: Max 10 requests per minute for chat
-    one_min_ago = now - timedelta(minutes=1)
-    min_stmt = select(func.count(AIUsage.id)).where(
-        AIUsage.owner_id == owner_id,
-        AIUsage.request_type == "chat",
-        AIUsage.created_at >= one_min_ago
-    )
-    min_count = (await db.execute(min_stmt)).scalar() or 0
+    # Rate limiting: max requests per minute and per 24 hours, counted in one
+    # query (each database round trip delays the reply).
+    min_count, day_count = await _usage_counts(db, owner_id, "chat", now)
     if min_count >= settings.MAX_AI_REQUESTS_PER_MIN:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Per-minute AI request limit exceeded. Please wait a moment before trying again."
         )
 
-    # Rate limiting: Max 100 requests per 24 hours for chat
-    twenty_four_hrs_ago = now - timedelta(hours=24)
-    day_stmt = select(func.count(AIUsage.id)).where(
-        AIUsage.owner_id == owner_id,
-        AIUsage.request_type == "chat",
-        AIUsage.created_at >= twenty_four_hrs_ago
-    )
-    day_count = (await db.execute(day_stmt)).scalar() or 0
     if day_count >= settings.MAX_AI_REQUESTS_PER_DAY:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -354,7 +359,10 @@ async def chat_stream(
         raise HTTPException(status_code=err.status_code, detail=err.message)
 
     # The reply has started, so it counts toward the quota now: a client that
-    # disconnects part-way still used the provider. Token counts follow below.
+    # disconnects part-way still used the provider. The row is saved alongside
+    # the stream, not before it: a database round trip here would hold back
+    # the first words while DeepSeek keeps writing, and the student would get
+    # the whole reply in one burst. Token counts follow at the end.
     usage_row = AIUsage(
         owner_id=account.id,
         request_type="chat",
@@ -362,8 +370,27 @@ async def chat_stream(
         completion_tokens=0,
         created_at=now,
     )
-    db.add(usage_row)
-    await db.commit()
+
+    async def record_start():
+        db.add(usage_row)
+        await db.commit()
+
+    recording = asyncio.create_task(record_start())
+
+    async def record_tokens(usage_data: dict):
+        await recording
+        usage_row.prompt_tokens = usage_data.get("prompt_tokens", 0)
+        usage_row.completion_tokens = usage_data.get("completion_tokens", 0)
+        await db.commit()
+
+    async def settle(work):
+        # Saved even if the student closes the connection meanwhile.
+        try:
+            await asyncio.shield(work)
+        except Exception as exc:
+            logger.warning(
+                f"Chat usage could not be saved ({type(exc).__name__}) [requestId={req.requestId}]"
+            )
 
     async def body():
         pending = first
@@ -374,9 +401,8 @@ async def chat_stream(
                     yield _sse({"type": "delta", "text": value})
                 else:
                     usage_data = value if isinstance(value, dict) else {}
-                    usage_row.prompt_tokens = usage_data.get("prompt_tokens", 0)
-                    usage_row.completion_tokens = usage_data.get("completion_tokens", 0)
-                    await db.commit()
+                    # The reply is complete: say so first, then save the
+                    # token counts while the connection closes.
                     yield _sse({
                         "type": "done",
                         "provider": "deepseek",
@@ -387,12 +413,15 @@ async def chat_stream(
                         "usedHandbook": bool(passages),
                         "sources": [passage.as_source() for passage in passages],
                     })
+                    await settle(asyncio.ensure_future(record_tokens(usage_data)))
                     return
                 pending = await anext(events)
         except StopAsyncIteration:
             return
         except DeepSeekError as err:
             yield _sse({"type": "error", "status": err.status_code, "message": err.message})
+        finally:
+            await settle(recording)
 
     return StreamingResponse(
         body(),
@@ -497,28 +526,14 @@ async def tts_proxy(
     now = datetime.now(timezone.utc)
     now_str = now.isoformat()
 
-    # Rate limiting: Max 10 TTS requests per minute
-    one_min_ago = now - timedelta(minutes=1)
-    min_stmt = select(func.count(AIUsage.id)).where(
-        AIUsage.owner_id == owner_id,
-        AIUsage.request_type == "tts",
-        AIUsage.created_at >= one_min_ago
-    )
-    min_count = (await db.execute(min_stmt)).scalar() or 0
+    # Rate limiting: per minute and per 24 hours, counted in one query.
+    min_count, day_count = await _usage_counts(db, owner_id, "tts", now)
     if min_count >= settings.MAX_TTS_REQUESTS_PER_MIN:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Per-minute TTS request limit exceeded. Please wait a moment before trying again."
         )
 
-    # Rate limiting: Max 100 TTS requests per 24 hours
-    twenty_four_hrs_ago = now - timedelta(hours=24)
-    day_stmt = select(func.count(AIUsage.id)).where(
-        AIUsage.owner_id == owner_id,
-        AIUsage.request_type == "tts",
-        AIUsage.created_at >= twenty_four_hrs_ago
-    )
-    day_count = (await db.execute(day_stmt)).scalar() or 0
     if day_count >= settings.MAX_TTS_REQUESTS_PER_DAY:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,

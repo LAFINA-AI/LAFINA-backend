@@ -1,6 +1,7 @@
+import json
 import logging
 import time
-from typing import Optional
+from typing import AsyncIterator, Optional
 from pydantic import BaseModel, Field
 import httpx
 
@@ -106,6 +107,26 @@ class DeepSeekTransportError(DeepSeekError):
         super().__init__(message, status_code=503)
 
 
+def upstream_error(status_code: int, detail: str) -> DeepSeekError:
+    """Maps a non-200 DeepSeek status to the client-safe error we raise."""
+    if status_code == 401:
+        return DeepSeekAuthenticationError(f"DeepSeek provider authentication failed: {detail}")
+    if status_code == 402:
+        return DeepSeekBillingError(f"DeepSeek provider billing is unavailable: {detail}")
+    if status_code == 429:
+        return DeepSeekRateLimitError(
+            f"DeepSeek rate limit exceeded. Please try again later: {detail}"
+        )
+    if status_code in (400, 422):
+        return DeepSeekInvalidRequestError(f"Invalid request sent to DeepSeek provider: {detail}")
+    if status_code in (500, 503):
+        return DeepSeekProviderServerError(f"DeepSeek provider temporary outage: {detail}")
+    return DeepSeekError(
+        message=f"DeepSeek provider returned error status {status_code}: {detail}",
+        status_code=502,
+    )
+
+
 class DeepSeekMessage(BaseModel):
     role: str
     content: Optional[str] = None
@@ -173,6 +194,103 @@ class DeepSeekClient:
             max_tokens=1024,
             temperature=0.7,
         )
+
+    async def chat_completion_stream(
+        self,
+        messages: list[dict[str, str]],
+        user_id: str,
+        request_id: str = "",
+    ) -> AsyncIterator[tuple[str, object]]:
+        """Streams a chat reply as it is generated.
+
+        Yields ``("delta", text)`` for each piece of the reply, then exactly
+        one ``("usage", dict)``. Upstream HTTP errors are raised before the
+        first yield, so callers can still answer with a normal error status.
+        Same model, settings and limits as :meth:`chat_completion`.
+        """
+        reason = self.settings.get_deepseek_key_invalid_reason()
+        if reason is not None:
+            logger.warning(
+                f"DeepSeek stream attempted without valid API key ({reason}) [requestId={request_id}]"
+            )
+            raise DeepSeekConfigError("DeepSeek API key is not configured.")
+        if self._client is None:
+            await self.start()
+        assert self._client is not None, "AsyncClient must be initialized"
+
+        raw_key = (
+            self.settings.DEEPSEEK_API_KEY.get_secret_value().strip().strip("'\"")
+            if self.settings.DEEPSEEK_API_KEY
+            else ""
+        )
+        payload = {
+            "model": self.settings.DEEPSEEK_MODEL,
+            "messages": messages,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+            "thinking": {"type": "disabled"},
+            "max_tokens": 1024,
+            "temperature": 0.7,
+            "user": user_id,
+        }
+        url = f"{self.settings.DEEPSEEK_BASE_URL.rstrip('/')}/chat/completions"
+        start_time = time.monotonic()
+        usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        produced = False
+        try:
+            async with self._client.stream(
+                "POST",
+                url,
+                headers={"Authorization": f"Bearer {raw_key}", "Content-Type": "application/json"},
+                json=payload,
+            ) as res:
+                if res.status_code != 200:
+                    body = (await res.aread()).decode("utf-8", "replace")
+                    detail = extract_upstream_error(body)
+                    logger.warning(
+                        f"DeepSeek stream upstream error HTTP {res.status_code} "
+                        f"[requestId={request_id}] model={self.settings.DEEPSEEK_MODEL} "
+                        f"upstream_detail={detail!r}"
+                    )
+                    raise upstream_error(res.status_code, detail)
+                async for line in res.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data)
+                    except ValueError:
+                        logger.error(f"DeepSeek stream sent malformed JSON [requestId={request_id}]")
+                        raise DeepSeekMalformedResponseError()
+                    if isinstance(chunk.get("usage"), dict):
+                        for key in usage:
+                            value = chunk["usage"].get(key)
+                            if isinstance(value, int):
+                                usage[key] = value
+                    for choice in chunk.get("choices") or []:
+                        text = (choice.get("delta") or {}).get("content")
+                        if isinstance(text, str) and text:
+                            produced = True
+                            yield "delta", text
+        except httpx.TimeoutException:
+            logger.warning(f"DeepSeek stream timed out [requestId={request_id}]")
+            raise DeepSeekTimeoutError()
+        except httpx.RequestError as exc:
+            logger.error(
+                f"DeepSeek stream transport failure ({type(exc).__name__}) [requestId={request_id}]"
+            )
+            raise DeepSeekTransportError()
+        if not produced:
+            raise DeepSeekMalformedResponseError("Received null or empty content from DeepSeek provider.")
+        duration_ms = int((time.monotonic() - start_time) * 1000)
+        logger.info(
+            f"DeepSeek stream success: duration={duration_ms}ms, model={self.settings.DEEPSEEK_MODEL}, "
+            f"prompt_tokens={usage['prompt_tokens']}, completion_tokens={usage['completion_tokens']} "
+            f"[requestId={request_id}]"
+        )
+        yield "usage", usage
 
     async def json_completion(
         self,
@@ -271,31 +389,7 @@ class DeepSeekClient:
                 f"[requestId={request_id}] model={chosen_model} "
                 f"upstream_detail={detail!r}"
             )
-            if status_code == 401:
-                raise DeepSeekAuthenticationError(
-                    f"DeepSeek provider authentication failed: {detail}"
-                )
-            elif status_code == 402:
-                raise DeepSeekBillingError(
-                    f"DeepSeek provider billing is unavailable: {detail}"
-                )
-            elif status_code == 429:
-                raise DeepSeekRateLimitError(
-                    f"DeepSeek rate limit exceeded. Please try again later: {detail}"
-                )
-            elif status_code in (400, 422):
-                raise DeepSeekInvalidRequestError(
-                    f"Invalid request sent to DeepSeek provider: {detail}"
-                )
-            elif status_code in (500, 503):
-                raise DeepSeekProviderServerError(
-                    f"DeepSeek provider temporary outage: {detail}"
-                )
-            else:
-                raise DeepSeekError(
-                    message=f"DeepSeek provider returned error status {status_code}: {detail}",
-                    status_code=502
-                )
+            raise upstream_error(status_code, detail)
 
         try:
             data = res.json()

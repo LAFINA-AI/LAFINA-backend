@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import binascii
+import json
 import logging
 import re
 import uuid
@@ -8,6 +9,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Literal, Annotated
 from pydantic import BaseModel, Field
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 
@@ -196,15 +198,13 @@ class AITtsResponse(BaseModel):
     createdAt: str
 
 
-@router.post("/chat", response_model=AIChatResponse)
-async def chat_proxy(
+async def _prepare_chat(
     req: AIChatRequest,
-    auth_data: Annotated[tuple[Account, AuthSession], Depends(get_current_user_and_session)],
-    db: AsyncSession = Depends(get_db),
-    deepseek: DeepSeekClient = Depends(get_deepseek_client),
-    handbook: HandbookRetriever | None = Depends(get_handbook_retriever),
-):
-    account, _ = auth_data
+    account: Account,
+    db: AsyncSession,
+    handbook: HandbookRetriever | None,
+) -> tuple[datetime, list[HandbookPassage], list[dict[str, str]]]:
+    """Access, size and quota checks plus the prompt, shared by both chat routes."""
     owner_id = account.id
 
     # Enforce role-based access for Online AI from live DB Account
@@ -215,7 +215,6 @@ async def chat_proxy(
         )
 
     now = datetime.now(timezone.utc)
-    now_str = now.isoformat()
 
     # Validate total character count across messages (max 8,000 chars)
     total_chars = sum(len(m.content) for m in req.messages)
@@ -270,6 +269,25 @@ async def chat_proxy(
         + handbook_context
         + [{"role": m.role, "content": m.content} for m in req.messages]
     )
+    return now, passages, formatted_messages
+
+
+def _sse(event: dict) -> str:
+    return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+
+@router.post("/chat", response_model=AIChatResponse)
+async def chat_proxy(
+    req: AIChatRequest,
+    auth_data: Annotated[tuple[Account, AuthSession], Depends(get_current_user_and_session)],
+    db: AsyncSession = Depends(get_db),
+    deepseek: DeepSeekClient = Depends(get_deepseek_client),
+    handbook: HandbookRetriever | None = Depends(get_handbook_retriever),
+):
+    account, _ = auth_data
+    owner_id = account.id
+    now, passages, formatted_messages = await _prepare_chat(req, account, db, handbook)
+    now_str = now.isoformat()
 
     try:
         reply_text, usage_data = await deepseek.chat_completion(
@@ -301,6 +319,83 @@ async def chat_proxy(
         createdAt=now_str,
         sources=[HandbookSource(**passage.as_source()) for passage in passages],
         usedHandbook=bool(passages),
+    )
+
+
+@router.post("/chat/stream")
+async def chat_stream(
+    req: AIChatRequest,
+    auth_data: Annotated[tuple[Account, AuthSession], Depends(get_current_user_and_session)],
+    db: AsyncSession = Depends(get_db),
+    deepseek: DeepSeekClient = Depends(get_deepseek_client),
+    handbook: HandbookRetriever | None = Depends(get_handbook_retriever),
+):
+    """The same reply as ``POST /chat``, sent piece by piece as Server-Sent Events.
+
+    Events, one JSON object per ``data:`` line:
+    ``{"type": "delta", "text": ...}`` for each piece of the reply, then either
+    ``{"type": "done", ...}`` (provider, usedHandbook, sources, model, requestId,
+    usage, createdAt) or ``{"type": "error", "status": ..., "message": ...}`` if
+    DeepSeek stops part-way. Access, quota and provider errors before the first
+    piece are ordinary HTTP errors, exactly as on ``/chat``.
+    """
+    account, _ = auth_data
+    now, passages, formatted_messages = await _prepare_chat(req, account, db, handbook)
+    events = deepseek.chat_completion_stream(
+        messages=formatted_messages,
+        user_id=str(account.id),
+        request_id=req.requestId,
+    )
+    try:
+        first = await anext(events)
+    except DeepSeekError as err:
+        raise HTTPException(status_code=err.status_code, detail=err.message)
+
+    # The reply has started, so it counts toward the quota now: a client that
+    # disconnects part-way still used the provider. Token counts follow below.
+    usage_row = AIUsage(
+        owner_id=account.id,
+        request_type="chat",
+        prompt_tokens=0,
+        completion_tokens=0,
+        created_at=now,
+    )
+    db.add(usage_row)
+    await db.commit()
+
+    async def body():
+        pending = first
+        try:
+            while True:
+                kind, value = pending
+                if kind == "delta":
+                    yield _sse({"type": "delta", "text": value})
+                else:
+                    usage_data = value if isinstance(value, dict) else {}
+                    usage_row.prompt_tokens = usage_data.get("prompt_tokens", 0)
+                    usage_row.completion_tokens = usage_data.get("completion_tokens", 0)
+                    await db.commit()
+                    yield _sse({
+                        "type": "done",
+                        "provider": "deepseek",
+                        "requestId": req.requestId,
+                        "model": settings.DEEPSEEK_MODEL,
+                        "usage": usage_data,
+                        "createdAt": now.isoformat(),
+                        "usedHandbook": bool(passages),
+                        "sources": [passage.as_source() for passage in passages],
+                    })
+                    return
+                pending = await anext(events)
+        except StopAsyncIteration:
+            return
+        except DeepSeekError as err:
+            yield _sse({"type": "error", "status": err.status_code, "message": err.message})
+
+    return StreamingResponse(
+        body(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 

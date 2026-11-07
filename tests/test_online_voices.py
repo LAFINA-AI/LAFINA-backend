@@ -112,3 +112,11 @@ async def test_catalogue_errors_are_actionable_and_redacted(status, expected):
 def test_deepseek_legacy_alias_and_explicit_model():
     assert Settings(_env_file=None, DEEPSEEK_MODEL="deepseek-v4-flash").DEEPSEEK_MODEL == "deepseek-flash"
     assert Settings(_env_file=None, DEEPSEEK_MODEL="deepseek-v4-pro").DEEPSEEK_MODEL == "deepseek-v4-pro"
+
+
+def test_persona_prompt_is_conversational_and_honest():
+    from app.api.v1.ai import LAFINA_SYSTEM_INSTRUCTION as prompt
+
+    assert "Always introduce yourself" not in prompt
+    assert "do not repeat the introduction" in prompt
+    assert "Never claim a task, reminder or event was saved" in prompt

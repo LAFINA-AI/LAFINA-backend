@@ -17,6 +17,7 @@ from app.models.synchronized_content import (  # noqa: F401
 )
 from app.models.mutations import IdempotentMutation  # noqa: F401
 from app.models.change_feed import ChangeFeed  # noqa: F401
+from app.models.voice_session import VoiceSession  # noqa: F401
 
 # Use in-memory SQLite with aiosqlite (shared cache) for fast backend unit tests
 TEST_DATABASE_URL = "sqlite+aiosqlite:///file:memdb1?mode=memory&cache=shared&uri=true"

@@ -12,6 +12,7 @@ from app.models.change_feed import ChangeFeed
 from app.models.sync_head import SyncHead
 from app.models.ai_usage import AIUsage, SecurityEvent
 from app.models.feature_flag import FeatureFlag
+from app.models.voice_session import VoiceSession
 
 __all__ = [
     "Account",
@@ -35,4 +36,5 @@ __all__ = [
     "AIUsage",
     "SecurityEvent",
     "FeatureFlag",
+    "VoiceSession",
 ]

@@ -200,13 +200,15 @@ class DeepSeekClient:
         messages: list[dict[str, str]],
         user_id: str,
         request_id: str = "",
+        max_tokens: int = 1024,
     ) -> AsyncIterator[tuple[str, object]]:
         """Streams a chat reply as it is generated.
 
         Yields ``("delta", text)`` for each piece of the reply, then exactly
         one ``("usage", dict)``. Upstream HTTP errors are raised before the
         first yield, so callers can still answer with a normal error status.
-        Same model, settings and limits as :meth:`chat_completion`.
+        Same model, settings and limits as :meth:`chat_completion`; only
+        ``content`` deltas are yielded, never ``reasoning_content``.
         """
         reason = self.settings.get_deepseek_key_invalid_reason()
         if reason is not None:
@@ -229,7 +231,7 @@ class DeepSeekClient:
             "stream": True,
             "stream_options": {"include_usage": True},
             "thinking": {"type": "disabled"},
-            "max_tokens": 1024,
+            "max_tokens": max_tokens,
             "temperature": 0.7,
             "user": user_id,
         }

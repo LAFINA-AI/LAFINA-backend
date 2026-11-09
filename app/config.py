@@ -182,6 +182,29 @@ class Settings(BaseSettings):
     ELEVENLABS_FAST_MODEL_ID: str = "eleven_v4_turbo"
     ELEVENLABS_MAX_CHARACTERS_PER_PROCESS: int = 20000
 
+    # Live voice conversation (ElevenAgents). The app connects to ElevenLabs
+    # with a signed URL minted here; ElevenLabs then calls
+    # `/v1/ai/voice/llm/chat/completions` for every turn, and that route answers
+    # with DeepSeek. All three must be set or the feature stays unavailable.
+    ELEVENLABS_AGENT_ID: Optional[str] = None
+    # Shared secret ElevenLabs sends as `Authorization: Bearer ...` to the
+    # custom-LLM route (stored in the agent's ElevenLabs secret store).
+    ELEVENLABS_AGENT_LLM_SECRET: SecretStr | None = None
+    # One conversation lasts at most this long. The agent's own
+    # `max_duration_seconds` must be the same value (see
+    # scripts/provision_voice_agent.py), so ElevenLabs ends the call too.
+    VOICE_CONVERSATION_MAX_SECONDS: int = 300
+    # Time allowed between minting the signed URL and the first turn.
+    VOICE_CONVERSATION_START_GRACE_SECONDS: int = 120
+    VOICE_CONVERSATION_MAX_TURNS: int = 30
+    VOICE_CONVERSATION_SESSIONS_PER_DAY: int = 6
+    VOICE_CONVERSATION_TURNS_PER_MIN: int = 12
+    VOICE_CONVERSATION_TURNS_PER_DAY: int = 150
+    # What one turn may send to DeepSeek: recent messages only, bounded.
+    VOICE_CONVERSATION_MAX_CONTEXT_MESSAGES: int = 12
+    VOICE_CONVERSATION_MAX_CONTEXT_CHARS: int = 6000
+    VOICE_CONVERSATION_MAX_REPLY_TOKENS: int = 300
+
     GEMINI_API_KEY: SecretStr | None = None
     GEMINI_BASE_URL: str = "https://generativelanguage.googleapis.com"
     GEMINI_TTS_MODEL: str = "gemini-3.1-flash-tts-preview"

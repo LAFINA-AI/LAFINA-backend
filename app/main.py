@@ -6,16 +6,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import get_settings
 from app.database import engine, Base
 import app.models  # noqa: F401
-from app.api.v1 import auth, sync, ai, meetings, meeting_notes
+from app.api.v1 import auth, sync, ai, meetings, meeting_notes, voice
 from app.admin import setup_admin
 from app.clients.deepseek import DeepSeekClient
 from app.clients.elevenlabs_tts import ElevenLabsTtsClient
+from app.clients.elevenlabs_agents import ElevenLabsAgentClient
 from app.clients.pinecone_index import PineconeIndexClient
 from app.services.handbook_rag import HandbookRetriever
 
 settings = get_settings()
 deepseek_client = DeepSeekClient(settings=settings)
 elevenlabs_tts_client = ElevenLabsTtsClient(settings=settings)
+elevenlabs_agent_client = ElevenLabsAgentClient(settings=settings)
 handbook_retriever = HandbookRetriever(settings, PineconeIndexClient(settings))
 
 
@@ -24,9 +26,11 @@ async def lifespan(app: FastAPI):
     # Initialize HTTP client pools
     await deepseek_client.start()
     await elevenlabs_tts_client.start()
+    await elevenlabs_agent_client.start()
     await handbook_retriever.start()
     app.state.deepseek_client = deepseek_client
     app.state.elevenlabs_tts_client = elevenlabs_tts_client
+    app.state.elevenlabs_agent_client = elevenlabs_agent_client
     app.state.handbook_retriever = handbook_retriever
     if not settings.is_handbook_configured():
         print(
@@ -54,6 +58,7 @@ async def lifespan(app: FastAPI):
     yield
     await deepseek_client.close()
     await elevenlabs_tts_client.close()
+    await elevenlabs_agent_client.close()
     await handbook_retriever.close()
     await engine.dispose()
 
@@ -69,6 +74,7 @@ app = FastAPI(
 
 app.state.deepseek_client = deepseek_client
 app.state.elevenlabs_tts_client = elevenlabs_tts_client
+app.state.elevenlabs_agent_client = elevenlabs_agent_client
 app.state.handbook_retriever = handbook_retriever
 
 # Paths that carry an uploaded document rather than a record, and so are held
@@ -128,6 +134,7 @@ if settings.ENVIRONMENT == "development":
 app.include_router(auth.router)
 app.include_router(sync.router)
 app.include_router(ai.router)
+app.include_router(voice.router)
 app.include_router(meeting_notes.router)
 app.include_router(meetings.router)
 

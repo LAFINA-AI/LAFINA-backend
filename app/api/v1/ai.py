@@ -68,6 +68,15 @@ from app.services.document_guardrails import (
 from app.services.document_render import MIME_TYPES, RENDERERS
 from app.clients.pinecone_index import PineconeIndexClient
 from app.services.feature_flags import HANDBOOK_RAG, is_enabled
+from app.services.chat_memory import (
+    MAX_EXCHANGE_CHARS,
+    MAX_EXCHANGE_MESSAGES,
+    MAX_MEMORIES,
+    MemoryItem,
+    build_extraction_messages,
+    build_memory_prompt,
+    parse_extraction,
+)
 from app.services.handbook_rag import (
     HandbookPassage,
     HandbookRetriever,
@@ -160,6 +169,9 @@ class AIChatRequest(BaseModel):
     # handbook off: the admin panel's `handbook_rag` flag still has the final
     # say, and clients that never send it (mobile, older desktops) keep it on.
     useHandbook: bool = True
+    # Facts the student's phone remembers about them (newest first). Optional;
+    # they ride along as a system note and are never stored on the server.
+    memories: list[MemoryItem] = Field(default_factory=list, max_length=MAX_MEMORIES)
 
 
 class HandbookSource(BaseModel):
@@ -271,8 +283,11 @@ async def _prepare_chat(
         if passages
         else []
     )
+    memory_note = build_memory_prompt(req.memories)
+    memory_context = [{"role": "system", "content": memory_note}] if memory_note else []
     formatted_messages = (
         [{"role": "system", "content": LAFINA_SYSTEM_INSTRUCTION}]
+        + memory_context
         + handbook_context
         + [{"role": m.role, "content": m.content} for m in req.messages]
     )
@@ -427,6 +442,86 @@ async def chat_stream(
         body(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+class MemoryExtractRequest(BaseModel):
+    requestId: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    # The latest exchange: normally the student's message and LAFINA's reply.
+    messages: list[ChatMessage] = Field(..., min_length=1, max_length=MAX_EXCHANGE_MESSAGES)
+    memories: list[MemoryItem] = Field(default_factory=list, max_length=MAX_MEMORIES)
+
+
+class MemoryExtractResponse(BaseModel):
+    requestId: str
+    # New memories to save on the phone, as short sentences.
+    add: list[str]
+    # Ids of the phone's memories to delete (outdated, wrong, or "forget that").
+    remove: list[str]
+    model: str
+
+
+@router.post("/memory/extract", response_model=MemoryExtractResponse)
+async def memory_extract(
+    req: MemoryExtractRequest,
+    auth_data: Annotated[tuple[Account, AuthSession], Depends(get_current_user_and_session)],
+    db: AsyncSession = Depends(get_db),
+    deepseek: DeepSeekClient = Depends(get_deepseek_client),
+):
+    """What to remember or forget from one chat exchange.
+
+    Same access as online chat. Nothing is stored here: the phone keeps its
+    memories and applies the answer. A reply the model garbles counts as "no
+    change", so a memory problem can never break a chat.
+    """
+    account, _ = auth_data
+    if not has_chat_access(account):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Sign in with an active account to use online chat."
+        )
+    if sum(len(m.content) for m in req.messages) > MAX_EXCHANGE_CHARS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The exchange is too long to check for memories.",
+        )
+
+    now = datetime.now(timezone.utc)
+    min_count, day_count = await _usage_counts(db, account.id, "memory", now)
+    if min_count >= settings.MAX_AI_REQUESTS_PER_MIN or day_count >= settings.MAX_AI_REQUESTS_PER_DAY:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Memory updates are paused for now. Please try again later.",
+        )
+
+    try:
+        raw, usage_data = await deepseek.json_completion(
+            messages=build_extraction_messages(
+                req.memories, [{"role": m.role, "content": m.content} for m in req.messages]
+            ),
+            user_id=str(account.id),
+            request_id=req.requestId,
+            max_tokens=300,
+            json_mode=True,
+        )
+    except DeepSeekError as err:
+        raise HTTPException(status_code=err.status_code, detail=err.message)
+
+    db.add(AIUsage(
+        owner_id=account.id,
+        request_type="memory",
+        prompt_tokens=usage_data.get("prompt_tokens", 0),
+        completion_tokens=usage_data.get("completion_tokens", 0),
+        created_at=now,
+    ))
+    await db.commit()
+
+    add, remove = parse_extraction(raw, req.memories, req.requestId)
+    logger.info(
+        f"Memory extraction: {len(add)} added, {len(remove)} removed [requestId={req.requestId}]"
+    )
+    return MemoryExtractResponse(
+        requestId=req.requestId, add=add, remove=remove, model=settings.DEEPSEEK_MODEL
     )
 
 

@@ -33,6 +33,7 @@ import sys
 import httpx
 
 from app.config import Settings
+from app.services.voice_conversation import voice_tool_definitions
 
 API = "https://api.elevenlabs.io"
 SECRET_NAME = "lafina_voice_llm_secret"
@@ -49,6 +50,7 @@ CLIENT_EVENTS = [
     "agent_response_complete",
     "vad_score",
     "client_error",
+    "client_tool_call",
 ]
 PLACEHOLDER_PROMPT = (
     "You are LAFINA, a friendly academic assistant for students. "
@@ -66,6 +68,17 @@ def agent_config(settings: Settings, server_url: str, secret_id: str, args) -> d
                 "prompt": {
                     "prompt": PLACEHOLDER_PROMPT,
                     "llm": "custom-llm",
+                    "tools": [
+                        {
+                            "type": "client",
+                            "name": tool["function"]["name"],
+                            "description": tool["function"]["description"],
+                            "parameters": tool["function"]["parameters"],
+                            "expects_response": True,
+                            "response_timeout_secs": 30,
+                        }
+                        for tool in voice_tool_definitions()
+                    ],
                     "custom_llm": {
                         # ElevenLabs appends /chat/completions.
                         "url": server_url.rstrip("/") + "/v1/ai/voice/llm",
@@ -163,6 +176,18 @@ def check(settings: Settings, agent_id: str, client: httpx.Client) -> int:
     }
     print(json.dumps(summary, indent=2))
     problems = []
+    expected_tools = {tool["function"]["name"] for tool in voice_tool_definitions()}
+    actual_tools = {
+        tool.get("name")
+        for tool in (prompt.get("tools") or [])
+        if isinstance(tool, dict)
+        and tool.get("type") == "client"
+        and tool.get("expects_response") is True
+    }
+    if not expected_tools.issubset(actual_tools):
+        problems.append("required client tools with response waiting are missing or not visible")
+    if "client_tool_call" not in (conv.get("conversation", {}).get("client_events") or []):
+        problems.append("client_tool_call event is not enabled")
     if summary["llm"] != "custom-llm":
         problems.append("agent does not use the custom LLM")
     if not summary["enable_auth"]:

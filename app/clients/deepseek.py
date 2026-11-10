@@ -47,6 +47,7 @@ def extract_upstream_error(body_text: str) -> str:
 
 class DeepSeekError(Exception):
     """Base exception for DeepSeek client errors."""
+
     def __init__(self, message: str, status_code: int = 502):
         super().__init__(message)
         self.message = message
@@ -55,54 +56,63 @@ class DeepSeekError(Exception):
 
 class DeepSeekConfigError(DeepSeekError):
     """Missing or invalid API key configuration (503 Service Unavailable)."""
+
     def __init__(self, message: str = "DeepSeek API key is not configured or invalid."):
         super().__init__(message, status_code=503)
 
 
 class DeepSeekAuthenticationError(DeepSeekError):
     """Upstream 401 Authentication Error (503 Service Unavailable)."""
+
     def __init__(self, message: str = "DeepSeek provider authentication failed."):
         super().__init__(message, status_code=503)
 
 
 class DeepSeekBillingError(DeepSeekError):
     """Upstream 402 Insufficient Balance / Billing Error (503 Service Unavailable)."""
+
     def __init__(self, message: str = "DeepSeek provider billing is unavailable."):
         super().__init__(message, status_code=503)
 
 
 class DeepSeekRateLimitError(DeepSeekError):
     """Upstream 429 Rate Limit Error (429 Too Many Requests)."""
+
     def __init__(self, message: str = "DeepSeek rate limit exceeded. Please try again later."):
         super().__init__(message, status_code=429)
 
 
 class DeepSeekInvalidRequestError(DeepSeekError):
     """Upstream 400 or 422 Invalid Request Error (502 Bad Gateway)."""
+
     def __init__(self, message: str = "Invalid request sent to DeepSeek provider."):
         super().__init__(message, status_code=502)
 
 
 class DeepSeekProviderServerError(DeepSeekError):
     """Upstream 500 or 503 Server Error (503 Service Unavailable)."""
+
     def __init__(self, message: str = "DeepSeek provider temporary outage."):
         super().__init__(message, status_code=503)
 
 
 class DeepSeekTimeoutError(DeepSeekError):
     """Request timeout (504 Gateway Timeout)."""
+
     def __init__(self, message: str = "DeepSeek AI assistant request timed out."):
         super().__init__(message, status_code=504)
 
 
 class DeepSeekMalformedResponseError(DeepSeekError):
     """Upstream payload malformed or missing choices/content (502 Bad Gateway)."""
+
     def __init__(self, message: str = "Received malformed response from DeepSeek provider."):
         super().__init__(message, status_code=502)
 
 
 class DeepSeekTransportError(DeepSeekError):
     """Network connection or transport failure (503 Service Unavailable)."""
+
     def __init__(self, message: str = "Failed to communicate with DeepSeek AI proxy."):
         super().__init__(message, status_code=503)
 
@@ -153,6 +163,68 @@ class DeepSeekCompletionResponse(BaseModel):
     usage: Optional[DeepSeekUsage] = None
 
 
+class SpeechReasoningFilter:
+    """Drop common hidden-reasoning tags even when tags cross stream chunks."""
+
+    PAIRS = (("<think>", "</think>"), ("<analysis>", "</analysis>"))
+
+    def __init__(self):
+        self.buffer = ""
+        self.end_tag = None
+
+    def feed(self, text: str, *, final: bool = False) -> str:
+        self.buffer += text
+        output = []
+        while self.buffer:
+            lower = self.buffer.lower()
+            if self.end_tag:
+                index = lower.find(self.end_tag)
+                if index < 0:
+                    self.buffer = "" if final else self.buffer[-(len(self.end_tag) - 1) :]
+                    break
+                self.buffer = self.buffer[index + len(self.end_tag) :]
+                self.end_tag = None
+                continue
+            matches = [
+                (lower.find(start), start, end)
+                for start, end in self.PAIRS
+                if lower.find(start) >= 0
+            ]
+            if matches:
+                index, start, end = min(matches)
+                output.append(self.buffer[:index])
+                self.buffer = self.buffer[index + len(start) :]
+                self.end_tag = end
+                continue
+            if final:
+                # Never speak an unfinished opening tag.
+                cut = self.buffer.rfind("<")
+                if cut >= 0 and any(
+                    start.startswith(self.buffer[cut:].lower()) for start, _ in self.PAIRS
+                ):
+                    self.buffer = self.buffer[:cut]
+                output.append(self.buffer)
+                self.buffer = ""
+            else:
+                keep = max(
+                    (
+                        size
+                        for start, _ in self.PAIRS
+                        for size in range(1, len(start))
+                        if lower.endswith(start[:size])
+                    ),
+                    default=0,
+                )
+                if keep:
+                    output.append(self.buffer[:-keep])
+                    self.buffer = self.buffer[-keep:]
+                else:
+                    output.append(self.buffer)
+                    self.buffer = ""
+                break
+        return "".join(output)
+
+
 class DeepSeekClient:
     """
     Production DeepSeek API client wrapping httpx.AsyncClient connection pool.
@@ -178,10 +250,7 @@ class DeepSeekClient:
             self._client = None
 
     async def chat_completion(
-        self,
-        messages: list[dict[str, str]],
-        user_id: str,
-        request_id: str = ""
+        self, messages: list[dict[str, str]], user_id: str, request_id: str = ""
     ) -> tuple[str, dict[str, int]]:
         """
         Executes chat completion request to DeepSeek API with non-thinking mode disabled.
@@ -201,6 +270,8 @@ class DeepSeekClient:
         user_id: str,
         request_id: str = "",
         max_tokens: int = 1024,
+        tools: Optional[list[dict]] = None,
+        sanitize_for_speech: bool = False,
     ) -> AsyncIterator[tuple[str, object]]:
         """Streams a chat reply as it is generated.
 
@@ -235,10 +306,16 @@ class DeepSeekClient:
             "temperature": 0.7,
             "user": user_id,
         }
+        if tools:
+            payload["tools"] = tools
         url = f"{self.settings.DEEPSEEK_BASE_URL.rstrip('/')}/chat/completions"
         start_time = time.monotonic()
+        calls: dict[int, dict] = {}
+        finish_reason = "stop"
         usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         produced = False
+        speech_filter = SpeechReasoningFilter() if sanitize_for_speech else None
+        stream_started = False
         try:
             async with self._client.stream(
                 "POST",
@@ -264,7 +341,9 @@ class DeepSeekClient:
                     try:
                         chunk = json.loads(data)
                     except ValueError:
-                        logger.error(f"DeepSeek stream sent malformed JSON [requestId={request_id}]")
+                        logger.error(
+                            f"DeepSeek stream sent malformed JSON [requestId={request_id}]"
+                        )
                         raise DeepSeekMalformedResponseError()
                     if isinstance(chunk.get("usage"), dict):
                         for key in usage:
@@ -272,10 +351,45 @@ class DeepSeekClient:
                             if isinstance(value, int):
                                 usage[key] = value
                     for choice in chunk.get("choices") or []:
-                        text = (choice.get("delta") or {}).get("content")
+                        if choice.get("finish_reason") == "tool_calls":
+                            finish_reason = "tool_calls"
+                        delta = choice.get("delta") or {}
+                        for part in delta.get("tool_calls") or []:
+                            if not isinstance(part, dict):
+                                raise DeepSeekMalformedResponseError("Invalid tool fragment.")
+                            idx = part.get("index")
+                            if not tools or not isinstance(idx, int) or idx < 0 or idx >= 5:
+                                raise DeepSeekMalformedResponseError("Invalid tool call.")
+                            item = calls.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+                            fn = part.get("function") or {}
+                            if not isinstance(fn, dict):
+                                raise DeepSeekMalformedResponseError("Invalid tool function.")
+                            for key, value in (
+                                ("id", part.get("id")),
+                                ("name", fn.get("name")),
+                                ("arguments", fn.get("arguments")),
+                            ):
+                                if value is not None:
+                                    if not isinstance(value, str):
+                                        raise DeepSeekMalformedResponseError(
+                                            "Invalid tool fragment."
+                                        )
+                                    item[key] += value
+                            if (
+                                len(item["arguments"]) > 5000
+                                or len(item["id"]) > 200
+                                or len(item["name"]) > 100
+                            ):
+                                raise DeepSeekMalformedResponseError("Tool call too large.")
+                        text = delta.get("content")
                         if isinstance(text, str) and text:
-                            produced = True
-                            yield "delta", text
+                            if speech_filter and not stream_started:
+                                stream_started = True
+                                yield "started", None
+                            visible = speech_filter.feed(text) if speech_filter else text
+                            if visible:
+                                produced = True
+                                yield "delta", visible
         except httpx.TimeoutException:
             logger.warning(f"DeepSeek stream timed out [requestId={request_id}]")
             raise DeepSeekTimeoutError()
@@ -284,8 +398,44 @@ class DeepSeekClient:
                 f"DeepSeek stream transport failure ({type(exc).__name__}) [requestId={request_id}]"
             )
             raise DeepSeekTransportError()
+        if speech_filter:
+            remaining = speech_filter.feed("", final=True)
+            if remaining:
+                produced = True
+                yield "delta", remaining
+        if calls:
+            allowed = {tool["function"]["name"] for tool in tools or []}
+            normalized = []
+            ids = set()
+            for idx, item in sorted(calls.items()):
+                try:
+                    arguments = json.loads(item["arguments"])
+                except ValueError:
+                    raise DeepSeekMalformedResponseError("Malformed tool arguments.") from None
+                if (
+                    item["name"] not in allowed
+                    or not item["id"]
+                    or item["id"] in ids
+                    or not isinstance(arguments, dict)
+                ):
+                    raise DeepSeekMalformedResponseError("Invalid tool call.")
+                ids.add(item["id"])
+                normalized.append(
+                    {
+                        "index": idx,
+                        "id": item["id"],
+                        "type": "function",
+                        "function": {"name": item["name"], "arguments": item["arguments"]},
+                    }
+                )
+            if finish_reason != "tool_calls":
+                raise DeepSeekMalformedResponseError("Incomplete tool call.")
+            produced = True
+            yield "tool_calls", normalized
         if not produced:
-            raise DeepSeekMalformedResponseError("Received null or empty content from DeepSeek provider.")
+            raise DeepSeekMalformedResponseError(
+                "Received null or empty content from DeepSeek provider."
+            )
         duration_ms = int((time.monotonic() - start_time) * 1000)
         logger.info(
             f"DeepSeek stream success: duration={duration_ms}ms, model={self.settings.DEEPSEEK_MODEL}, "
@@ -343,11 +493,12 @@ class DeepSeekClient:
 
         assert self._client is not None, "AsyncClient must be initialized"
 
-        raw_key = self.settings.DEEPSEEK_API_KEY.get_secret_value().strip().strip("'\"") if self.settings.DEEPSEEK_API_KEY else ""
-        headers = {
-            "Authorization": f"Bearer {raw_key}",
-            "Content-Type": "application/json"
-        }
+        raw_key = (
+            self.settings.DEEPSEEK_API_KEY.get_secret_value().strip().strip("'\"")
+            if self.settings.DEEPSEEK_API_KEY
+            else ""
+        )
+        headers = {"Authorization": f"Bearer {raw_key}", "Content-Type": "application/json"}
 
         chosen_model = model or self.settings.DEEPSEEK_MODEL
         payload = {
@@ -357,7 +508,7 @@ class DeepSeekClient:
             "thinking": {"type": "disabled"},
             "max_tokens": max_tokens,
             "temperature": temperature,
-            "user": user_id
+            "user": user_id,
         }
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
@@ -369,7 +520,9 @@ class DeepSeekClient:
             res = await self._client.post(url, headers=headers, json=payload)
         except httpx.TimeoutException:
             duration_ms = int((time.monotonic() - start_time) * 1000)
-            logger.warning(f"DeepSeek request timed out after {duration_ms}ms [requestId={request_id}]")
+            logger.warning(
+                f"DeepSeek request timed out after {duration_ms}ms [requestId={request_id}]"
+            )
             raise DeepSeekTimeoutError()
         except httpx.RequestError as exc:
             duration_ms = int((time.monotonic() - start_time) * 1000)
@@ -404,17 +557,21 @@ class DeepSeekClient:
 
         if not parsed.choices:
             logger.error(f"DeepSeek choices array empty [requestId={request_id}]")
-            raise DeepSeekMalformedResponseError("Received empty choice array from DeepSeek provider.")
+            raise DeepSeekMalformedResponseError(
+                "Received empty choice array from DeepSeek provider."
+            )
 
         reply_content = parsed.choices[0].message.content
         if reply_content is None or reply_content.strip() == "":
             logger.error(f"DeepSeek message content null or empty [requestId={request_id}]")
-            raise DeepSeekMalformedResponseError("Received null or empty content from DeepSeek provider.")
+            raise DeepSeekMalformedResponseError(
+                "Received null or empty content from DeepSeek provider."
+            )
 
         usage_dict = {
             "prompt_tokens": parsed.usage.prompt_tokens if parsed.usage else 0,
             "completion_tokens": parsed.usage.completion_tokens if parsed.usage else 0,
-            "total_tokens": parsed.usage.total_tokens if parsed.usage else 0
+            "total_tokens": parsed.usage.total_tokens if parsed.usage else 0,
         }
 
         logger.info(

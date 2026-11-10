@@ -615,3 +615,103 @@ async def test_reengagement_after_silence_does_not_repeat_the_last_answer(async_
     assert response.status_code == 200
     assert spoken(response) == ""
     assert deepseek_calls(world) == []
+
+
+async def test_voice_tool_call_and_result_round_trip(async_client, world):
+    headers = await signed_in(async_client)
+    session = (await start(async_client, headers)).json()
+    tools = [{"type": "function", "function": {"name": "search_notes"}}]
+    world["deepseek"] = httpx.Response(
+        200,
+        content=sse(
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {"name": "search_notes", "arguments": '{"query":'},
+                                }
+                            ]
+                        },
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [{"index": 0, "function": {"arguments": '"physics"}'}}]
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ]
+            },
+            USAGE,
+            "[DONE]",
+        ),
+    )
+    response = await async_client.post(
+        LLM_PATH,
+        headers=llm_headers(session["grant"]),
+        json={"messages": [{"role": "user", "content": "find my notes"}], "tools": tools},
+    )
+    assert response.status_code == 200
+    assert '"tool_calls"' in response.text and "call_1" in response.text
+    outbound = json.loads(deepseek_calls(world)[-1].content)
+    assert outbound["tools"][0]["function"]["name"] == "search_notes"
+    world["deepseek"] = httpx.Response(
+        200, content=sse(delta("I found one note."), USAGE, "[DONE]")
+    )
+    calls = [
+        {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "search_notes", "arguments": '{"query":"physics"}'},
+        }
+    ]
+    messages = [
+        {"role": "user", "content": "find my notes"},
+        {"role": "assistant", "content": None, "tool_calls": calls},
+        {"role": "tool", "tool_call_id": "call_1", "content": "one note"},
+    ]
+    response = await async_client.post(
+        LLM_PATH, headers=llm_headers(session["grant"]), json={"messages": messages, "tools": tools}
+    )
+    assert response.status_code == 200
+    assert spoken(response) == "I found one note."
+    outbound = json.loads(deepseek_calls(world)[-1].content)
+    assert outbound["messages"][-1]["tool_call_id"] == "call_1"
+    before = len(deepseek_calls(world))
+    messages[-1]["tool_call_id"] = "forged"
+    response = await async_client.post(
+        LLM_PATH, headers=llm_headers(session["grant"]), json={"messages": messages, "tools": tools}
+    )
+    assert response.status_code == 400
+    assert len(deepseek_calls(world)) == before
+
+
+async def test_hidden_reasoning_never_reaches_spoken_stream(async_client, world):
+    headers = await signed_in(async_client)
+    session = (await start(async_client, headers)).json()
+    world["deepseek"] = httpx.Response(
+        200,
+        content=sse(
+            delta("Let me <thi"),
+            delta("nk>secret chain</th"),
+            delta("ink> help you."),
+            USAGE,
+            "[DONE]",
+        ),
+    )
+    response = await async_client.post(
+        LLM_PATH, headers=llm_headers(session["grant"]), json=turn_body("hello")
+    )
+    assert response.status_code == 200
+    assert spoken(response) == "Let me  help you."
+    assert "secret chain" not in response.text

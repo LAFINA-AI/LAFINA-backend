@@ -72,6 +72,8 @@ from app.services.voice_conversation import (
     VoiceGrantError,
     completion_chunk,
     conversation_turns,
+    approved_voice_tools,
+    voice_tool_continuation,
     issue_grant,
     read_grant,
     turn_key,
@@ -468,7 +470,25 @@ async def voice_llm_turn(
         )
 
     raw_messages = body.get("messages")
-    turns = conversation_turns(
+    try:
+        approved_tools = approved_voice_tools(body.get("tools"))
+    except ValueError:
+        return _llm_error(400, "Unsupported voice tool.", "invalid_tools")
+    continuation = voice_tool_continuation(
+        raw_messages,
+        allowed_names={t["function"]["name"] for t in approved_tools},
+        max_messages=settings.VOICE_CONVERSATION_MAX_CONTEXT_MESSAGES,
+        max_chars=settings.VOICE_CONVERSATION_MAX_CONTEXT_CHARS,
+    )
+    if (
+        isinstance(raw_messages, list)
+        and raw_messages
+        and isinstance(raw_messages[-1], dict)
+        and raw_messages[-1].get("role") == "tool"
+        and not continuation
+    ):
+        return _llm_error(400, "Invalid voice tool continuation.", "invalid_tool_result")
+    turns = continuation or conversation_turns(
         raw_messages,
         max_messages=settings.VOICE_CONVERSATION_MAX_CONTEXT_MESSAGES,
         max_chars=settings.VOICE_CONVERSATION_MAX_CONTEXT_CHARS,
@@ -536,7 +556,11 @@ async def voice_llm_turn(
         passages = await _handbook_passages(
             handbook,
             db,
-            [ChatMessage(role=t["role"], content=t["content"][:4090]) for t in turns],
+            [
+                ChatMessage(role=t["role"], content=t["content"][:4090])
+                for t in turns
+                if t["role"] in ("user", "assistant") and isinstance(t.get("content"), str)
+            ],
             request_id,
         )
     formatted = (
@@ -561,6 +585,8 @@ async def voice_llm_turn(
         user_id=str(owner_id),
         request_id=request_id,
         max_tokens=settings.VOICE_CONVERSATION_MAX_REPLY_TOKENS,
+        tools=approved_tools or None,
+        sanitize_for_speech=True,
     )
     try:
         first = await anext(events)
@@ -595,14 +621,29 @@ async def voice_llm_turn(
 
     async def stream():
         pending = first
+        calls_seen = False
         yield _sse(completion_chunk(completion_id, created, model, text=""))
         try:
             while True:
                 kind, value = pending
                 if kind == "delta":
                     yield _sse(completion_chunk(completion_id, created, model, text=value))
+                elif kind == "started":
+                    pass
+                elif kind == "tool_calls":
+                    calls_seen = True
+                    chunk = completion_chunk(completion_id, created, model)
+                    chunk["choices"][0]["delta"] = {"tool_calls": value}
+                    yield _sse(chunk)
                 else:
-                    yield _sse(completion_chunk(completion_id, created, model, finish="stop"))
+                    yield _sse(
+                        completion_chunk(
+                            completion_id,
+                            created,
+                            model,
+                            finish="tool_calls" if calls_seen else "stop",
+                        )
+                    )
                     yield "data: [DONE]\n\n"
                     await settle(
                         asyncio.ensure_future(save_tokens(value if isinstance(value, dict) else {}))

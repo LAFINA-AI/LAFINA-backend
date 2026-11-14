@@ -81,3 +81,13 @@ def test_spoken_stream_drops_split_and_unclosed_reasoning_tags():
     assert filt.feed("Hi <analysis>private", final=True) == "Hi "
     filt = SpeechReasoningFilter()
     assert filt.feed("Safe <thi", final=True) == "Safe "
+
+
+def test_contract_matches_current_mobile_tools():
+    """The server contract must follow the app's registry (mobile `REGISTERED_TOOLS`)."""
+    from app.services.voice_conversation import voice_tool_definitions
+
+    tools = {t["function"]["name"]: t["function"] for t in voice_tool_definitions()}
+    read = tools["read_lafina_data"]["parameters"]["properties"]["kind"]["enum"]
+    assert read == ["calendar", "todos", "notes", "memory"]
+    assert all(t["parameters"].get("additionalProperties") is False for t in tools.values())

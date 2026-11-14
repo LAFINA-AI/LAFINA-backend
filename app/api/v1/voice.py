@@ -76,6 +76,7 @@ from app.services.voice_conversation import (
     voice_tool_continuation,
     issue_grant,
     read_grant,
+    student_context_prompt,
     turn_key,
 )
 
@@ -563,11 +564,15 @@ async def voice_llm_turn(
             ],
             request_id,
         )
+    student_note = student_context_prompt(
+        extra, settings.VOICE_CONVERSATION_MAX_STUDENT_CONTEXT_CHARS
+    )
     formatted = (
         [
             {"role": "system", "content": LAFINA_SYSTEM_INSTRUCTION},
             {"role": "system", "content": VOICE_STYLE_INSTRUCTION},
         ]
+        + ([{"role": "system", "content": student_note}] if student_note else [])
         + (
             [
                 {

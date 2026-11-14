@@ -203,6 +203,8 @@ class Settings(BaseSettings):
     # What one turn may send to DeepSeek: recent messages only, bounded.
     VOICE_CONVERSATION_MAX_CONTEXT_MESSAGES: int = 12
     VOICE_CONVERSATION_MAX_CONTEXT_CHARS: int = 6000
+    # The phone's planner/notes/memories summary sent with each turn (characters).
+    VOICE_CONVERSATION_MAX_STUDENT_CONTEXT_CHARS: int = 12000
     VOICE_CONVERSATION_MAX_REPLY_TOKENS: int = 300
 
     GEMINI_API_KEY: SecretStr | None = None

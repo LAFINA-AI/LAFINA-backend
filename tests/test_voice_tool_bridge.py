@@ -89,5 +89,9 @@ def test_contract_matches_current_mobile_tools():
 
     tools = {t["function"]["name"]: t["function"] for t in voice_tool_definitions()}
     read = tools["read_lafina_data"]["parameters"]["properties"]["kind"]["enum"]
-    assert read == ["calendar", "todos", "notes", "memory"]
+    assert read == ["calendar", "todos", "notes", "alarms", "memory"]
+    actions = tools["prepare_lafina_action"]["parameters"]["properties"]["action"]["enum"]
+    assert {"create_alarm", "toggle_alarm"} <= set(actions)
+    # Deleting needs the student's own words; the model can never ask for it.
+    assert not any(action.startswith("delete") for action in actions)
     assert all(t["parameters"].get("additionalProperties") is False for t in tools.values())

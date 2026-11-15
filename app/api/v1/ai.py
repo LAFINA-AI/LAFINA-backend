@@ -236,8 +236,14 @@ async def _prepare_chat(
     account: Account,
     db: AsyncSession,
     handbook: HandbookRetriever | None,
+    usage_type: str = "chat",
+    limit_scale: int = 1,
 ) -> tuple[datetime, list[HandbookPassage], list[dict[str, str]]]:
-    """Access, size and quota checks plus the prompt, shared by both chat routes."""
+    """Access, size and quota checks plus the prompt, shared by both chat routes.
+
+    ``usage_type`` and ``limit_scale`` let a Chat agent's follow-up steps use
+    their own, larger bucket, so one question is charged to ``chat`` once.
+    """
     owner_id = account.id
 
     # Enforce role-based access for Online AI from live DB Account
@@ -259,17 +265,17 @@ async def _prepare_chat(
 
     # Rate limiting: max requests per minute and per 24 hours, counted in one
     # query (each database round trip delays the reply).
-    min_count, day_count = await _usage_counts(db, owner_id, "chat", now)
-    if min_count >= settings.MAX_AI_REQUESTS_PER_MIN:
+    min_count, day_count = await _usage_counts(db, owner_id, usage_type, now)
+    if min_count >= settings.MAX_AI_REQUESTS_PER_MIN * limit_scale:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Per-minute AI request limit exceeded. Please wait a moment before trying again."
         )
 
-    if day_count >= settings.MAX_AI_REQUESTS_PER_DAY:
+    if day_count >= settings.MAX_AI_REQUESTS_PER_DAY * limit_scale:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Daily AI request quota reached (100 requests/day)."
+            detail=f"Daily AI request quota reached ({settings.MAX_AI_REQUESTS_PER_DAY} requests/day)."
         )
 
     # Student Handbook passages ride along as a second system message, so they
@@ -500,6 +506,10 @@ class ChatAgentResponse(BaseModel):
     sources: list[HandbookSource] = Field(default_factory=list)
 
 
+CHAT_AGENT_MAX_TOOL_ROUNDS = 3
+CHAT_AGENT_STEP_USAGE = "chat_agent_step"
+
+
 @router.post("/chat/agent", response_model=ChatAgentResponse)
 async def chat_agent(
     req: ChatAgentRequest,
@@ -525,6 +535,9 @@ async def chat_agent(
         raise HTTPException(status_code=400, detail="Unsupported chat tool.")
     tools = approved_voice_tools([{"type": "function", "function": {"name": n}} for n in req.tools])
     continuation: list[dict] = []
+    # The app runs at most 4 steps per question: 3 tool rounds, then a reply.
+    if sum(1 for m in req.exchange if m.get("role") == "assistant") > CHAT_AGENT_MAX_TOOL_ROUNDS:
+        raise HTTPException(status_code=400, detail="Too many agent steps for one question.")
     if req.exchange:
         continuation = voice_tool_continuation(
             [{"role": "user", "content": req.messages[-1].content}, *req.exchange],
@@ -535,7 +548,18 @@ async def chat_agent(
         if not continuation:
             raise HTTPException(status_code=400, detail="Invalid tool exchange.")
 
-    now, passages, formatted_messages = await _prepare_chat(req, account, db, handbook)
+    # The first step of a question counts as one chat request; its follow-up
+    # steps use a separate bucket three times as large, so a multi-step answer
+    # costs the student one request (abuse stays bounded by that bucket).
+    usage_type = CHAT_AGENT_STEP_USAGE if req.exchange else "chat"
+    now, passages, formatted_messages = await _prepare_chat(
+        req,
+        account,
+        db,
+        handbook,
+        usage_type=usage_type,
+        limit_scale=3 if req.exchange else 1,
+    )
     notes = [{"role": "system", "content": CHAT_AGENT_INSTRUCTION}]
     local_now = " ".join((req.localNow or "").split())
     if local_now and all(ch.isprintable() for ch in local_now):
@@ -570,7 +594,7 @@ async def chat_agent(
     db.add(
         AIUsage(
             owner_id=account.id,
-            request_type="chat",
+            request_type=usage_type,
             prompt_tokens=usage_data.get("prompt_tokens", 0),
             completion_tokens=usage_data.get("completion_tokens", 0),
             created_at=now,

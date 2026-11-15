@@ -66,7 +66,7 @@ def test_agent_config_declares_waiting_client_tools():
     )
     config = agent_config(settings, "https://example.invalid", "secret-ref", args)
     tools = config["conversation_config"]["agent"]["prompt"]["tools"]
-    assert len(tools) == 12
+    assert len(tools) == 14
     assert all(t["type"] == "client" and t["expects_response"] for t in tools)
     assert "client_tool_call" in config["conversation_config"]["conversation"]["client_events"]
 

@@ -76,6 +76,8 @@ from app.services.voice_conversation import (
     voice_tool_continuation,
     issue_grant,
     read_grant,
+    app_updates_prompt,
+    message_role_counts,
     student_context_prompt,
     turn_key,
 )
@@ -567,12 +569,15 @@ async def voice_llm_turn(
     student_note = student_context_prompt(
         extra, settings.VOICE_CONVERSATION_MAX_STUDENT_CONTEXT_CHARS
     )
+    updates_note = app_updates_prompt(raw_messages)
+    logger.info(f"Voice turn messages: {message_role_counts(raw_messages)} [{request_id}]")
     formatted = (
         [
             {"role": "system", "content": LAFINA_SYSTEM_INSTRUCTION},
             {"role": "system", "content": VOICE_STYLE_INSTRUCTION},
         ]
         + ([{"role": "system", "content": student_note}] if student_note else [])
+        + ([{"role": "system", "content": updates_note}] if updates_note else [])
         + (
             [
                 {

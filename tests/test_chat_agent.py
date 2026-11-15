@@ -214,3 +214,43 @@ async def test_agent_steps_share_the_chat_quota(async_client, upstream, monkeypa
     headers = await signed_in(async_client)
     assert (await async_client.post("/v1/ai/chat/agent", headers=headers, json=ASK)).status_code == 200
     assert (await async_client.post("/v1/ai/chat/agent", headers=headers, json=ASK)).status_code == 429
+
+
+def continuation(rounds: int) -> list[dict]:
+    exchange: list[dict] = []
+    for i in range(rounds):
+        call = {
+            "id": f"c{i}",
+            "type": "function",
+            "function": {"name": "find_free_time", "arguments": '{"date":"2026-11-16"}'},
+        }
+        exchange += [
+            {"role": "assistant", "content": None, "tool_calls": [call]},
+            {"role": "tool", "tool_call_id": f"c{i}", "content": "Monday: 1:00 PM - 5:00 PM"},
+        ]
+    return exchange
+
+
+async def test_follow_up_steps_charge_one_question_once(async_client, upstream, monkeypatch):
+    from app.api.v1 import ai
+
+    monkeypatch.setattr(ai.settings, "MAX_AI_REQUESTS_PER_MIN", 1)
+    headers = await signed_in(async_client)
+    assert (await async_client.post("/v1/ai/chat/agent", headers=headers, json=ASK)).status_code == 200
+    # Steps 2 to 4 of the same question use their own bucket (1 x 3 here).
+    for rounds in (1, 2, 3):
+        request = {**ASK, "exchange": continuation(rounds)}
+        response = await async_client.post("/v1/ai/chat/agent", headers=headers, json=request)
+        assert response.status_code == 200, response.text
+    assert len(await usage_rows()) == 1
+    # The follow-up bucket is still bounded.
+    request = {**ASK, "exchange": continuation(1)}
+    assert (await async_client.post("/v1/ai/chat/agent", headers=headers, json=request)).status_code == 429
+
+
+async def test_more_than_three_tool_rounds_is_refused(async_client, upstream):
+    headers = await signed_in(async_client)
+    request = {**ASK, "exchange": continuation(4)}
+    response = await async_client.post("/v1/ai/chat/agent", headers=headers, json=request)
+    assert response.status_code == 400
+    assert upstream["requests"] == []

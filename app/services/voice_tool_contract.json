@@ -3,7 +3,7 @@
     "type": "function",
     "function": {
       "name": "read_lafina_data",
-      "description": "Reads the student\u2019s schedule/calendar, to-do list, saved notes, or personal memories from local device storage.",
+      "description": "Reads the student\u2019s schedule/calendar, to-do list, saved notes, alarms, or personal memories from local device storage.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -13,6 +13,7 @@
               "calendar",
               "todos",
               "notes",
+              "alarms",
               "memory"
             ],
             "description": "The type of local student data to read."
@@ -33,7 +34,7 @@
     "type": "function",
     "function": {
       "name": "prepare_lafina_action",
-      "description": "Prepares a to-do, task, event, time block, reminder, or note review card (creation, completion, edit, or deletion) for student confirmation. Nothing is saved until confirmed. The app first reads the student\u2019s own words; fill the structured fields too when the details came from earlier in the conversation (for example a free time you found), so the card can still be prepared. Deleting needs the student\u2019s own words.",
+      "description": "Prepares a to-do, task, event, time block, reminder, alarm, or note review card (creation, completion, edit, or deletion) for student confirmation. Nothing is saved until confirmed. The app first reads the student\u2019s own words; fill the structured fields too when the details came from earlier in the conversation (for example a free time you found), so the card can still be prepared. Deleting needs the student\u2019s own words.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -53,7 +54,9 @@
               "update_time_block",
               "update_note",
               "complete_task",
-              "reopen_task"
+              "reopen_task",
+              "create_alarm",
+              "toggle_alarm"
             ],
             "description": "Optional. What to prepare when the details came from the conversation."
           },
@@ -101,6 +104,14 @@
               "notify"
             ],
             "description": "Optional. For reminders: \"call\" rings a reminder call, \"notify\" posts an ordinary notification."
+          },
+          "repeat": {
+            "type": "string",
+            "description": "Optional, new items only. \"daily\", \"weekdays\", or \"weekly:\" plus two-letter days, e.g. \"weekly:mo,we\"."
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "Optional. For toggle_alarm: true turns the alarm on, false turns it off. Name the alarm by \"time\" (HH:MM) or its label in \"title\"."
           }
         },
         "required": [

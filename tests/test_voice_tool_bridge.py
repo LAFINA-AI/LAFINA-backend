@@ -89,5 +89,9 @@ def test_contract_matches_current_mobile_tools():
 
     tools = {t["function"]["name"]: t["function"] for t in voice_tool_definitions()}
     read = tools["read_lafina_data"]["parameters"]["properties"]["kind"]["enum"]
-    assert read == ["calendar", "todos", "notes", "memory"]
+    assert read == ["calendar", "todos", "notes", "alarms", "memory"]
+    prepare = tools["prepare_lafina_action"]["parameters"]["properties"]
+    assert prepare["location"]["type"] == "string"
+    assert prepare["category"]["type"] == "string"
+    assert "create_alarm" in prepare["action"]["enum"]
     assert all(t["parameters"].get("additionalProperties") is False for t in tools.values())

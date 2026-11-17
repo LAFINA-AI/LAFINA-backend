@@ -816,3 +816,170 @@ def test_unusable_student_context_is_ignored(extra):
     from app.services.voice_conversation import student_context_prompt
 
     assert student_context_prompt(extra, 1000) is None
+
+
+# Call feature remediation: synthetic providers and real host SQLite only.
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Hello",
+        "Add capstone meeting tomorrow at 5 PM",
+        "What is on my schedule tomorrow?",
+        "Move the meeting to four",
+    ],
+)
+async def test_non_policy_voice_turn_skips_handbook(async_client, world, monkeypatch, question):
+    async def forbidden(*args):
+        pytest.fail("ordinary voice turn must not wait for handbook retrieval")
+
+    monkeypatch.setattr(voice, "_handbook_passages", forbidden)
+    headers = await signed_in(async_client)
+    session = (await start(async_client, headers, useHandbook=True)).json()
+    response = await async_client.post(
+        LLM_PATH, headers=llm_headers(session["grant"]), json=turn_body(question)
+    )
+    assert response.status_code == 200
+    assert spoken(response)
+
+
+async def test_policy_voice_turn_retrieves_with_bounded_timeout(async_client, world, monkeypatch):
+    import asyncio
+
+    entered = []
+
+    async def slow(*args):
+        entered.append(True)
+        await asyncio.sleep(10)
+        return []
+
+    monkeypatch.setattr(voice, "_handbook_passages", slow)
+    monkeypatch.setattr(voice.settings, "HANDBOOK_TIMEOUT_SECONDS", 0.01)
+    headers = await signed_in(async_client)
+    session = (await start(async_client, headers, useHandbook=True)).json()
+    response = await async_client.post(
+        LLM_PATH,
+        headers=llm_headers(session["grant"]),
+        json=turn_body("What does the USTP attendance policy say?"),
+    )
+    assert response.status_code == 200
+    assert entered == [True]
+    assert spoken(response)
+
+
+async def test_voice_prompt_has_capabilities_and_no_shared_chat_denial(async_client, world):
+    headers = await signed_in(async_client)
+    session = (await start(async_client, headers)).json()
+    await async_client.post(
+        LLM_PATH, headers=llm_headers(session["grant"]), json=turn_body("Can you save a meeting?")
+    )
+    sent = json.loads(deepseek_calls(world)[0].content)
+    prompt = " ".join(m["content"] for m in sent["messages"] if m["role"] == "system")
+    assert "You cannot create or modify local schedules" not in prompt
+    assert "Capstone Meeting" in prompt
+    assert "explicit successful commit receipt" in prompt
+    assert "prepare_multi_action" in prompt
+    assert "first person" in prompt
+
+
+async def test_transient_pre_stream_failure_keeps_call_recoverable(async_client, world):
+    world["deepseek"] = httpx.Response(503, json={"error": {"message": "temporary outage"}})
+    headers = await signed_in(async_client)
+    session = (await start(async_client, headers)).json()
+    response = await async_client.post(
+        LLM_PATH, headers=llm_headers(session["grant"]), json=turn_body("hello")
+    )
+    assert response.status_code == 200
+    assert "try again" in spoken(response)
+    assert "saved" not in spoken(response)
+    assert chunks(response)[-1] == "[DONE]"
+
+
+async def test_tool_only_stream_starts_before_remaining_arguments():
+    import asyncio
+
+    gate = asyncio.Event()
+
+    class ToolStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield sse(
+                {
+                    "choices": [
+                        {
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_early",
+                                        "function": {"name": "read_calendar", "arguments": "{"},
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }
+            )
+            await gate.wait()
+            yield sse(
+                {
+                    "choices": [
+                        {
+                            "delta": {"tool_calls": [{"index": 0, "function": {"arguments": "}"}}]},
+                            "finish_reason": "tool_calls",
+                        }
+                    ]
+                },
+                "[DONE]",
+            )
+
+    config = Settings(_env_file=None, ENVIRONMENT="development", DEEPSEEK_API_KEY="synthetic-key")
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda req: httpx.Response(200, stream=ToolStream()))
+    ) as http:
+        client = DeepSeekClient(config, http)
+        events = client.chat_completion_stream(
+            messages=[{"role": "user", "content": "my schedule"}],
+            user_id="synthetic",
+            tools=[
+                {
+                    "type": "function",
+                    "function": {"name": "read_calendar", "parameters": {"type": "object"}},
+                }
+            ],
+            sanitize_for_speech=True,
+        )
+        assert await anext(events) == ("started", None)
+        assert not gate.is_set()
+        gate.set()
+        rest = [item async for item in events]
+        assert rest[0][0] == "tool_calls"
+        assert rest[0][1][0]["function"]["arguments"] == "{}"
+
+
+def test_provision_defaults_to_balanced_turns_and_detects_schema_drift(monkeypatch, capsys):
+    import sys
+
+    from scripts import provision_voice_agent as provision
+
+    config = Settings(_env_file=None, ENVIRONMENT="development", ELEVENLABS_VOICE_ID="test_voice")
+    monkeypatch.setattr(provision, "Settings", lambda: config)
+    monkeypatch.setattr(
+        sys, "argv", ["provision", "--server-url", "https://lafina-backend.vercel.app"]
+    )
+    assert provision.main() == 0
+    dry_run = json.loads(capsys.readouterr().out)
+    assert dry_run["conversation_config"]["turn"]["turn_eagerness"] == "normal"
+    with httpx.Client(
+        transport=httpx.MockTransport(lambda req: httpx.Response(200, json=dry_run))
+    ) as client:
+        assert provision.check(config, "synthetic-agent", client) == 0
+    prepare = next(
+        t
+        for t in dry_run["conversation_config"]["agent"]["prompt"]["tools"]
+        if t["name"] == "prepare_lafina_action"
+    )
+    del prepare["parameters"]["properties"]["location"]
+    with httpx.Client(
+        transport=httpx.MockTransport(lambda req: httpx.Response(200, json=dry_run))
+    ) as client:
+        assert provision.check(config, "synthetic-agent", client) == 1
+    assert "tool schema differs" in capsys.readouterr().out

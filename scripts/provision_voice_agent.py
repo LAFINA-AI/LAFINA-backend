@@ -103,7 +103,7 @@ def agent_config(settings: Settings, server_url: str, secret_id: str, args) -> d
             },
             "asr": {"user_input_audio_format": "pcm_16000", "quality": "high"},
             "turn": {
-                # Students pause to think: wait longer before taking the turn.
+                # Balanced everyday turn taking; patient remains an explicit option.
                 "turn_eagerness": args.turn_eagerness,
                 # Seconds of silence before LAFINA speaks up again (1-30).
                 "turn_timeout": args.turn_timeout,
@@ -186,6 +186,26 @@ def check(settings: Settings, agent_id: str, client: httpx.Client) -> int:
     }
     if not expected_tools.issubset(actual_tools):
         problems.append("required client tools with response waiting are missing or not visible")
+    actual_by_name = {
+        tool.get("name"): tool for tool in (prompt.get("tools") or []) if isinstance(tool, dict)
+    }
+    for definition in voice_tool_definitions():
+        fn = definition["function"]
+        actual = actual_by_name.get(fn["name"], {}).get("parameters", {})
+        expected = fn["parameters"]
+        # Descriptions may be normalized by the provider; compare actual fields
+        # and constraints so an older agent cannot pass a name-only check.
+        expected_props = expected.get("properties", {})
+        actual_props = actual.get("properties", {})
+        if any(
+            name not in actual_props
+            or actual_props[name].get("type") != spec.get("type")
+            or actual_props[name].get("enum") != spec.get("enum")
+            for name, spec in expected_props.items()
+        ):
+            problems.append(f"tool schema differs: {fn['name']}")
+        if set(actual.get("required", [])) != set(expected.get("required", [])):
+            problems.append(f"tool required fields differ: {fn['name']}")
     if "client_tool_call" not in (conv.get("conversation", {}).get("client_events") or []):
         problems.append("client_tool_call event is not enabled")
     if summary["llm"] != "custom-llm":
@@ -222,7 +242,7 @@ def main() -> int:
     parser.add_argument("--language", default="en", help='Agent language, e.g. "en" or "fil".')
     parser.add_argument("--tts-model", default="eleven_v4_turbo")
     parser.add_argument(
-        "--turn-eagerness", default="patient", choices=["patient", "normal", "eager"]
+        "--turn-eagerness", default="normal", choices=["patient", "normal", "eager"]
     )
     parser.add_argument("--turn-timeout", type=float, default=15.0)
     parser.add_argument("--first-message", default="Hi, I'm listening. What's on your mind?")

@@ -3,7 +3,7 @@
     "type": "function",
     "function": {
       "name": "read_lafina_data",
-      "description": "Reads the student\u2019s schedule/calendar, to-do list, saved notes, or personal memories from local device storage.",
+      "description": "Reads the student’s schedule/calendar, to-do list, saved notes, alarms, or personal memories from local device storage.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -13,6 +13,7 @@
               "calendar",
               "todos",
               "notes",
+              "alarms",
               "memory"
             ],
             "description": "The type of local student data to read."
@@ -33,7 +34,7 @@
     "type": "function",
     "function": {
       "name": "prepare_lafina_action",
-      "description": "Prepares a to-do, task, event, time block, reminder, or note review card (creation, completion, edit, or deletion) for student confirmation. Nothing is saved until confirmed. The app first reads the student\u2019s own words; fill the structured fields too when the details came from earlier in the conversation (for example a free time you found), so the card can still be prepared. Deleting needs the student\u2019s own words.",
+      "description": "Prepares a to-do, task, event, time block, reminder, alarm, or note review card for student confirmation. Nothing is saved until the student confirms. Supply structured action, concise title and known date/time fields from the conversation; omit unknown details so the app can ask for them. Use prepare_multi_action for several items. Deleting needs the student’s own words.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -53,9 +54,11 @@
               "update_time_block",
               "update_note",
               "complete_task",
-              "reopen_task"
+              "reopen_task",
+              "create_alarm",
+              "toggle_alarm"
             ],
-            "description": "Optional. What to prepare when the details came from the conversation."
+            "description": "What to prepare. Supply this for structured online interpretation."
           },
           "title": {
             "type": "string",
@@ -94,6 +97,14 @@
             "type": "string",
             "description": "Optional. Note text or extra details."
           },
+          "location": {
+            "type": "string",
+            "description": "Optional event location."
+          },
+          "category": {
+            "type": "string",
+            "description": "Optional planner category."
+          },
           "deliveryStyle": {
             "type": "string",
             "enum": [
@@ -101,6 +112,14 @@
               "notify"
             ],
             "description": "Optional. For reminders: \"call\" rings a reminder call, \"notify\" posts an ordinary notification."
+          },
+          "repeat": {
+            "type": "string",
+            "description": "Optional, new items only. \"daily\", \"weekdays\", or \"weekly:\" plus two-letter days, e.g. \"weekly:mo,we\"."
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "Optional. For toggle_alarm: true turns the alarm on, false turns it off. Name the alarm by \"time\" (HH:MM) or its label in \"title\"."
           }
         },
         "required": [
@@ -114,7 +133,7 @@
     "type": "function",
     "function": {
       "name": "find_free_time",
-      "description": "Finds free windows on one day between 7:00 AM and 10:00 PM that fit a session of the given length, using the student\u2019s local calendar. Read-only.",
+      "description": "Finds free windows on one day between 7:00 AM and 10:00 PM that fit a session of the given length, using the student’s local calendar. Read-only.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -292,7 +311,7 @@
     "type": "function",
     "function": {
       "name": "confirm_draft",
-      "description": "Confirms and commits the pending draft card to the student database.",
+      "description": "Reports a draft save after the student explicitly confirms by speech or the card button. Never use this tool to authorize a save yourself.",
       "parameters": {
         "type": "object",
         "properties": {

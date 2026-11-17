@@ -2,8 +2,9 @@ import json
 import logging
 import time
 from typing import AsyncIterator, Optional
-from pydantic import BaseModel, Field
+
 import httpx
+from pydantic import BaseModel, Field
 
 from app.config import Settings
 
@@ -354,6 +355,9 @@ class DeepSeekClient:
                         if choice.get("finish_reason") == "tool_calls":
                             finish_reason = "tool_calls"
                         delta = choice.get("delta") or {}
+                        if delta.get("tool_calls") and not stream_started:
+                            stream_started = True
+                            yield "started", None
                         for part in delta.get("tool_calls") or []:
                             if not isinstance(part, dict):
                                 raise DeepSeekMalformedResponseError("Invalid tool fragment.")

@@ -24,6 +24,7 @@ import asyncio
 import hmac
 import json
 import logging
+import re
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -36,7 +37,6 @@ from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.ai import (
-    LAFINA_SYSTEM_INSTRUCTION,
     ChatMessage,
     _handbook_passages,
     _usage_counts,
@@ -70,16 +70,19 @@ from app.services.voice_conversation import (
     GRANT_HEADER,
     VOICE_STYLE_INSTRUCTION,
     VoiceGrantError,
+    app_updates_prompt,
+    approved_voice_tools,
     completion_chunk,
     conversation_turns,
-    approved_voice_tools,
-    voice_tool_continuation,
     issue_grant,
-    read_grant,
-    app_updates_prompt,
     message_role_counts,
+    read_grant,
     student_context_prompt,
     turn_key,
+    voice_tool_continuation,
+)
+from app.services.voice_conversation import (
+    VOICE_SYSTEM_INSTRUCTION as LAFINA_SYSTEM_INSTRUCTION,
 )
 
 router = APIRouter(prefix="/v1/ai/voice", tags=["voice"])
@@ -415,6 +418,21 @@ def _shared_secret_ok(request: Request) -> bool:
     return hmac.compare_digest(supplied.encode(), f"Bearer {expected}".encode())
 
 
+def _should_use_voice_handbook(text: str) -> bool:
+    """Only policy questions pay the retrieval latency on the voice path."""
+    if re.search(
+        r"\b(?:add|create|schedule|remind|book|move|rename|delete|cancel|set)\b", text, re.I
+    ) and not re.search(r"\b(?:policy|handbook|allowed|rules|requirements)\b", text, re.I):
+        return False
+    return bool(
+        re.search(
+            r"\b(?:handbook|ustp|policy|policies|regulations|dress code|grading|attendance|absences|retention|scholarship|latin honors|dean.s list|uniform|plagiarism|probation|graduation requirements|academic rules)\b",
+            text,
+            re.I,
+        )
+    )
+
+
 @router.post("/llm/chat/completions")
 async def voice_llm_turn(
     request: Request,
@@ -555,17 +573,24 @@ async def voice_llm_turn(
 
     request_id = f"voice-{session_id}-{row.turns + 1}"
     passages = []
-    if row.use_handbook:
-        passages = await _handbook_passages(
-            handbook,
-            db,
-            [
-                ChatMessage(role=t["role"], content=t["content"][:4090])
-                for t in turns
-                if t["role"] in ("user", "assistant") and isinstance(t.get("content"), str)
-            ],
-            request_id,
-        )
+    last_user = next((t["content"] for t in reversed(turns) if t["role"] == "user"), "")
+    retrieval_at = time.monotonic()
+    if row.use_handbook and not continuation and _should_use_voice_handbook(last_user):
+        try:
+            passages = await asyncio.wait_for(
+                _handbook_passages(
+                    handbook, db, [ChatMessage(role="user", content=last_user[:4090])], request_id
+                ),
+                timeout=min(settings.HANDBOOK_TIMEOUT_SECONDS, 2.0),
+            )
+        except TimeoutError:
+            logger.info("Voice handbook budget exceeded [%s]", request_id)
+    logger.info(
+        "Voice retrieval duration=%dms used=%s [%s]",
+        int((time.monotonic() - retrieval_at) * 1000),
+        bool(passages),
+        request_id,
+    )
     student_note = student_context_prompt(
         extra, settings.VOICE_CONVERSATION_MAX_STUDENT_CONTEXT_CHARS
     )
@@ -599,11 +624,38 @@ async def voice_llm_turn(
         sanitize_for_speech=True,
     )
     try:
-        first = await anext(events)
-    except DeepSeekError as err:
+        first_at = time.monotonic()
+        first = await asyncio.wait_for(anext(events), timeout=12.0)
+        logger.info(
+            "Voice first model event=%dms [%s]",
+            int((time.monotonic() - first_at) * 1000),
+            request_id,
+        )
+    except (DeepSeekError, TimeoutError) as err:
+        if isinstance(err, TimeoutError):
+            err = DeepSeekTimeoutError()
         code = _provider_error_code(err)
         logger.warning(f"Voice turn failed before the first words ({code}) [{request_id}]")
         await _record_error(db, row, code)
+        if code in {"provider_timeout", "provider_unavailable"}:
+
+            async def retry_response():
+                yield _sse(
+                    completion_chunk(
+                        completion_id,
+                        created,
+                        model,
+                        text="I couldn't finish that response. Please try again, or check the card for any action result.",
+                    )
+                )
+                yield _sse(completion_chunk(completion_id, created, model, finish="stop"))
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(
+                retry_response(),
+                media_type="text/event-stream",
+                headers={**NO_STORE, "X-Accel-Buffering": "no"},
+            )
         return _llm_error(err.status_code, _STUDENT_MESSAGES[code], code)
 
     async def save_tokens(usage: dict) -> None:
@@ -659,15 +711,19 @@ async def voice_llm_turn(
                         asyncio.ensure_future(save_tokens(value if isinstance(value, dict) else {}))
                     )
                     return
-                pending = await anext(events)
+                pending = await asyncio.wait_for(anext(events), timeout=12.0)
         except StopAsyncIteration:
             yield "data: [DONE]\n\n"
-        except DeepSeekError as err:
+        except (DeepSeekError, TimeoutError) as err:
+            if isinstance(err, TimeoutError):
+                err = DeepSeekTimeoutError()
             code = _provider_error_code(err)
             logger.warning(f"Voice turn stopped part-way ({code}) [{request_id}]")
             yield _sse({"error": {"message": _STUDENT_MESSAGES[code], "type": code}})
             yield "data: [DONE]\n\n"
             await settle(asyncio.ensure_future(_record_error(db, row, code)))
+        finally:
+            await events.aclose()
 
     return StreamingResponse(
         stream(),

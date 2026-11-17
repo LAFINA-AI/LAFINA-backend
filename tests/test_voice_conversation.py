@@ -968,6 +968,10 @@ def test_provision_defaults_to_balanced_turns_and_detects_schema_drift(monkeypat
     assert provision.main() == 0
     dry_run = json.loads(capsys.readouterr().out)
     assert dry_run["conversation_config"]["turn"]["turn_eagerness"] == "normal"
+    assert all(
+        "additionalProperties" not in tool["parameters"]
+        for tool in dry_run["conversation_config"]["agent"]["prompt"]["tools"]
+    )
     with httpx.Client(
         transport=httpx.MockTransport(lambda req: httpx.Response(200, json=dry_run))
     ) as client:
@@ -983,3 +987,27 @@ def test_provision_defaults_to_balanced_turns_and_detects_schema_drift(monkeypat
     ) as client:
         assert provision.check(config, "synthetic-agent", client) == 1
     assert "tool schema differs" in capsys.readouterr().out
+
+
+def test_client_tool_schema_adapts_without_weakening_server_contract():
+    from scripts.provision_voice_agent import client_tool_schema
+
+    original = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "items": {
+                "type": "array",
+                "items": {"type": "object", "additionalProperties": False, "required": ["title"]},
+            }
+        },
+    }
+    adapted = client_tool_schema(original)
+    assert "additionalProperties" not in adapted
+    assert "additionalProperties" not in adapted["properties"]["items"]["items"]
+    assert adapted["properties"]["items"]["items"]["required"] == ["title"]
+    assert adapted["description"]
+    assert adapted["properties"]["items"]["description"]
+    assert adapted["properties"]["items"]["items"]["description"]
+    assert original["additionalProperties"] is False
+    assert original["properties"]["items"]["items"]["additionalProperties"] is False

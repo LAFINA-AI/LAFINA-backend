@@ -58,6 +58,37 @@ PLACEHOLDER_PROMPT = (
 )
 
 
+def client_tool_schema(value, field_name="parameters"):
+    """Adapt server JSON Schema to ElevenLabs' client-tool schema subset.
+
+    Keep additionalProperties=false in the server-owned DeepSeek contract;
+    ElevenLabs rejects that keyword in client parameters and nested objects.
+    """
+    if isinstance(value, dict):
+        adapted = {
+            key: client_tool_schema(item, key)
+            for key, item in value.items()
+            if key != "additionalProperties"
+        }
+        # ElevenLabs requires a value source for every typed property, including
+        # nested batch items. JSON Schema permits bare type/enum declarations.
+        if "type" in adapted and not any(
+            adapted.get(key)
+            for key in (
+                "description",
+                "dynamic_variable",
+                "is_system_provided",
+                "constant_value",
+                "is_omitted",
+            )
+        ):
+            adapted["description"] = f"The {field_name.replace('_', ' ')} value."
+        return adapted
+    if isinstance(value, list):
+        return [client_tool_schema(item, field_name) for item in value]
+    return value
+
+
 def agent_config(settings: Settings, server_url: str, secret_id: str, args) -> dict:
     return {
         "name": args.name,
@@ -73,7 +104,7 @@ def agent_config(settings: Settings, server_url: str, secret_id: str, args) -> d
                             "type": "client",
                             "name": tool["function"]["name"],
                             "description": tool["function"]["description"],
-                            "parameters": tool["function"]["parameters"],
+                            "parameters": client_tool_schema(tool["function"]["parameters"]),
                             "expects_response": True,
                             "response_timeout_secs": 30,
                         }

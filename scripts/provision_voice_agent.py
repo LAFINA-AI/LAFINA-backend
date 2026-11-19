@@ -19,6 +19,10 @@ Run from the repository root with the private .env (never print it):
     # Update the existing agent in place (ELEVENLABS_AGENT_ID or --agent-id):
     python -m scripts.provision_voice_agent --server-url https://... --apply --update
 
+    # Patch only the timeouts that keep calls from being dropped (dry run
+    # without --apply); run after the matching server change is deployed:
+    python -m scripts.provision_voice_agent --tune-reliability --apply
+
 The ElevenLabs key needs ElevenAgents (Conversational AI) write access for
 --apply and read access for --check; the running server needs ElevenAgents
 read access (signed URLs) and the existing Text to Speech / Voices access.
@@ -56,6 +60,31 @@ PLACEHOLDER_PROMPT = (
     "You are LAFINA, a friendly academic assistant for students. "
     "(LAFINA's server supplies the full instructions for every turn.)"
 )
+
+
+# How long ElevenLabs waits on the custom LLM before it counts the attempt as
+# failed and retries (2-15 s; ElevenLabs' default is 4). Repeated failures end
+# the call. The server answers within VOICE_FIRST_WORDS_TIMEOUT_SECONDS plus
+# handbook and database time, so this must stay above that.
+CASCADE_TIMEOUT_SECONDS = 15.0
+# Time the server may need before first words beyond the DeepSeek wait:
+# handbook retrieval (2 s budget) plus database and cold-start time.
+SERVER_OVERHEAD_SECONDS = 4.0
+
+
+def reliability_prompt_config() -> dict:
+    # With a custom LLM and no backup, ElevenLabs only retries our own route.
+    return {"cascade_timeout_seconds": CASCADE_TIMEOUT_SECONDS}
+
+
+def reliability_patch(args) -> dict:
+    """Only the fields that keep calls from being dropped; nothing else."""
+    return {
+        "conversation_config": {
+            "agent": {"prompt": reliability_prompt_config()},
+            "turn": {"turn_timeout": args.turn_timeout},
+        }
+    }
 
 
 def client_tool_schema(value, field_name="parameters"):
@@ -125,6 +154,7 @@ def agent_config(settings: Settings, server_url: str, secret_id: str, args) -> d
                     },
                     "temperature": 0.7,
                     "max_tokens": settings.VOICE_CONVERSATION_MAX_REPLY_TOKENS,
+                    **reliability_prompt_config(),
                 },
             },
             "tts": {
@@ -202,6 +232,10 @@ def check(settings: Settings, agent_id: str, client: httpx.Client) -> int:
         "output_format": conv.get("tts", {}).get("agent_output_audio_format"),
         "input_format": conv.get("asr", {}).get("user_input_audio_format"),
         "turn_eagerness": conv.get("turn", {}).get("turn_eagerness"),
+        "turn_timeout": conv.get("turn", {}).get("turn_timeout"),
+        "speculative_turn": conv.get("turn", {}).get("speculative_turn"),
+        "cascade_timeout_seconds": prompt.get("cascade_timeout_seconds"),
+        "server_first_words_timeout": settings.VOICE_FIRST_WORDS_TIMEOUT_SECONDS,
         "max_duration_seconds": conv.get("conversation", {}).get("max_duration_seconds"),
         "server_max_seconds": settings.VOICE_CONVERSATION_MAX_SECONDS,
     }
@@ -251,6 +285,14 @@ def check(settings: Settings, agent_id: str, client: httpx.Client) -> int:
         problems.append("the app streams pcm_16000 in and plays pcm_16000 out")
     if summary["max_duration_seconds"] != settings.VOICE_CONVERSATION_MAX_SECONDS:
         problems.append("max_duration_seconds differs from VOICE_CONVERSATION_MAX_SECONDS")
+    cascade = summary["cascade_timeout_seconds"]
+    needed = settings.VOICE_FIRST_WORDS_TIMEOUT_SECONDS + SERVER_OVERHEAD_SECONDS
+    if not isinstance(cascade, (int, float)) or cascade < needed:
+        problems.append(
+            f"cascade_timeout_seconds is {cascade}; below {needed:g} s ElevenLabs gives up on "
+            "a slow answer before the server can reply, retries, and may end the call "
+            "(fix with --tune-reliability --apply)"
+        )
     for problem in problems:
         print("PROBLEM:", problem)
     return 1 if problems else 0
@@ -275,8 +317,17 @@ def main() -> int:
     parser.add_argument(
         "--turn-eagerness", default="normal", choices=["patient", "normal", "eager"]
     )
-    parser.add_argument("--turn-timeout", type=float, default=15.0)
+    # Silence before LAFINA speaks up ("I'm still here whenever you're
+    # ready."); the longest ElevenLabs allows, so a student reading a card is
+    # not interrupted every few seconds.
+    parser.add_argument("--turn-timeout", type=float, default=30.0)
     parser.add_argument("--first-message", default="Hi, I'm listening. What's on your mind?")
+    parser.add_argument(
+        "--tune-reliability",
+        action="store_true",
+        help="Patch only the cascade and turn timeouts of the existing agent "
+        "(dry run unless --apply). No secret upload, no other field changes.",
+    )
     args = parser.parse_args()
 
     settings = Settings()
@@ -286,6 +337,21 @@ def main() -> int:
         if not agent_id:
             sys.exit("No agent to check: set ELEVENLABS_AGENT_ID or pass --agent-id.")
         with httpx.Client(headers={"xi-api-key": _key(settings)}, timeout=20) as client:
+            return check(settings, agent_id, client)
+
+    if args.tune_reliability:
+        patch = reliability_patch(args)
+        if not args.apply:
+            print(json.dumps(patch, indent=2))
+            print("\nDry run only. Add --apply to patch the agent.", file=sys.stderr)
+            return 0
+        if not agent_id:
+            sys.exit("No agent to patch: set ELEVENLABS_AGENT_ID or pass --agent-id.")
+        with httpx.Client(headers={"xi-api-key": _key(settings)}, timeout=30) as client:
+            response = client.patch(f"{API}/v1/convai/agents/{agent_id}", json=patch)
+            if response.status_code != 200:
+                _fail(response, "Patching the agent timeouts")
+            print(f"Patched timeouts of agent {agent_id}.")
             return check(settings, agent_id, client)
 
     if not args.server_url or not args.server_url.startswith("https://"):

@@ -76,6 +76,7 @@ from app.services.voice_conversation import (
     conversation_turns,
     issue_grant,
     message_role_counts,
+    pending_tool_result,
     read_grant,
     student_context_prompt,
     turn_key,
@@ -91,6 +92,8 @@ logger = logging.getLogger("lafina.voice")
 
 SESSION_USAGE = "voice_session"
 TURN_USAGE = "voice_turn"
+# A model call that finishes a student turn after a tool result (no new words).
+TOOL_TURN_USAGE = "voice_tool_turn"
 CONVERSATION_ID_PATTERN = r"^[A-Za-z0-9_-]{1,128}$"
 NO_STORE = {"Cache-Control": "no-store"}
 
@@ -495,175 +498,122 @@ async def voice_llm_turn(
         approved_tools = approved_voice_tools(body.get("tools"))
     except ValueError:
         return _llm_error(400, "Unsupported voice tool.", "invalid_tools")
+    allowed_names = {t["function"]["name"] for t in approved_tools}
     continuation = voice_tool_continuation(
         raw_messages,
-        allowed_names={t["function"]["name"] for t in approved_tools},
-        max_messages=settings.VOICE_CONVERSATION_MAX_CONTEXT_MESSAGES,
-        max_chars=settings.VOICE_CONVERSATION_MAX_CONTEXT_CHARS,
-    )
-    if (
-        isinstance(raw_messages, list)
-        and raw_messages
-        and isinstance(raw_messages[-1], dict)
-        and raw_messages[-1].get("role") == "tool"
-        and not continuation
-    ):
-        return _llm_error(400, "Invalid voice tool continuation.", "invalid_tool_result")
-    turns = continuation or conversation_turns(
-        raw_messages,
-        max_messages=settings.VOICE_CONVERSATION_MAX_CONTEXT_MESSAGES,
-        max_chars=settings.VOICE_CONVERSATION_MAX_CONTEXT_CHARS,
+        allowed_names=allowed_names,
+        max_messages=settings.VOICE_TOOL_EXCHANGE_MAX_MESSAGES,
+        max_chars=settings.VOICE_TOOL_EXCHANGE_MAX_CHARS,
     )
     model = settings.DEEPSEEK_MODEL
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
 
-    if not turns:
-        # Silence or noise: nothing to answer, nothing paid.
-        async def empty():
-            yield _sse(completion_chunk(completion_id, created, model, finish="stop"))
-            yield "data: [DONE]\n\n"
+    def say(text: str) -> StreamingResponse:
+        return _spoken_response(completion_id, created, model, text)
 
-        return StreamingResponse(
-            empty(), media_type="text/event-stream", headers={**NO_STORE, "X-Accel-Buffering": "no"}
+    # From here on a live call never gets an error status or an empty answer.
+    # ElevenLabs treats either as a failed generation, retries the same
+    # request, and ends the whole call when the retries fail too. The student
+    # hears one short sentence instead, and the call goes on.
+    if not continuation and pending_tool_result(raw_messages, allowed_names):
+        # Re-answering the student's words here would run the same tool again.
+        logger.warning(
+            f"Voice tool result could not be read: {message_role_counts(raw_messages)} "
+            f"[voiceSession={row.id}]"
         )
+        return say(TOOL_RESULT_FALLBACK)
+    turns = continuation or conversation_turns(
+        raw_messages,
+        max_messages=settings.VOICE_CONVERSATION_MAX_CONTEXT_MESSAGES,
+        max_chars=settings.VOICE_CONVERSATION_MAX_CONTEXT_CHARS,
+    )
+    if not turns:
+        # Nothing new to answer: ElevenLabs re-engaging after a silence (the
+        # history ends with LAFINA's words), or noise. Nothing is paid.
+        return say(SILENCE_CHECK_IN if _lafina_spoke_last(raw_messages) else NOT_HEARD)
 
-    minute_turns, day_turns = await _usage_counts(db, owner_id, TURN_USAGE, now)
-    if minute_turns >= settings.VOICE_CONVERSATION_TURNS_PER_MIN:
-        await _record_error(db, row, "rate_limited")
-        return _llm_error(429, _STUDENT_MESSAGES["rate_limited"], "rate_limited")
-    if day_turns >= settings.VOICE_CONVERSATION_TURNS_PER_DAY:
-        await _record_error(db, row, "daily_limit")
-        return _llm_error(429, _STUDENT_MESSAGES["daily_limit"], "daily_limit")
-
-    # Reserve the turn atomically before paying for it: within budget, still
-    # active, and not the same turn delivered a second time.
-    key = turn_key(conversation_id or row.conversation_id, len(raw_messages), turns[-1]["content"])
-    await set_transaction_rls_user(db, owner_id)
-    reserved = await db.execute(
-        update(VoiceSession)
-        .where(
+    # One student turn is paid once, however often ElevenLabs asks for it
+    # (retries after a slow attempt, speculative requests). Tool follow-ups
+    # finish a turn already paid for, so they do not count against the
+    # student's turn limits; their tokens are still recorded.
+    key = turn_key(
+        conversation_id or row.conversation_id,
+        len(raw_messages) if isinstance(raw_messages, list) else 0,
+    )
+    redelivery = row.last_turn_key == key
+    usage_row: AIUsage | None = None
+    if not redelivery:
+        if not continuation:
+            minute_turns, day_turns = await _usage_counts(db, owner_id, TURN_USAGE, now)
+            if minute_turns >= settings.VOICE_CONVERSATION_TURNS_PER_MIN:
+                await _record_error(db, row, "rate_limited")
+                return say(_STUDENT_MESSAGES["rate_limited"])
+            if day_turns >= settings.VOICE_CONVERSATION_TURNS_PER_DAY:
+                await _record_error(db, row, "daily_limit")
+                return say(_STUDENT_MESSAGES["daily_limit"])
+        # Reserve the turn atomically before paying for it: within budget,
+        # still active, and not already reserved by a parallel request.
+        conditions = [
             VoiceSession.id == session_id,
             VoiceSession.status == "active",
-            VoiceSession.turns < settings.VOICE_CONVERSATION_MAX_TURNS,
             or_(VoiceSession.last_turn_key.is_(None), VoiceSession.last_turn_key != key),
-        )
-        .values(
-            turns=VoiceSession.turns + 1,
-            last_turn_key=key,
-            conversation_id=func.coalesce(VoiceSession.conversation_id, conversation_id),
-            last_error_code=None,
-            last_error_message=None,
-        )
-        .execution_options(synchronize_session=False)
-    )
-    if reserved.rowcount != 1:
-        await db.rollback()
+        ]
+        if not continuation:
+            conditions.append(VoiceSession.turns < settings.VOICE_CONVERSATION_MAX_TURNS)
         await set_transaction_rls_user(db, owner_id)
-        await db.refresh(row)
-        if row.last_turn_key == key:
-            return _llm_error(409, "This turn is already being answered.", "duplicate_turn")
-        if row.status != "active":
-            return _llm_error(409, "This voice conversation has ended.", "session_ended")
-        await _record_error(db, row, "turn_limit")
-        return _llm_error(429, _STUDENT_MESSAGES["turn_limit"], "turn_limit")
-    usage_row = AIUsage(owner_id=owner_id, request_type=TURN_USAGE, created_at=now)
-    db.add(usage_row)
-    await db.commit()
-
-    request_id = f"voice-{session_id}-{row.turns + 1}"
-    passages = []
-    last_user = next((t["content"] for t in reversed(turns) if t["role"] == "user"), "")
-    retrieval_at = time.monotonic()
-    if row.use_handbook and not continuation and _should_use_voice_handbook(last_user):
-        try:
-            passages = await asyncio.wait_for(
-                _handbook_passages(
-                    handbook, db, [ChatMessage(role="user", content=last_user[:4090])], request_id
-                ),
-                timeout=min(settings.HANDBOOK_TIMEOUT_SECONDS, 2.0),
+        reserved = await db.execute(
+            update(VoiceSession)
+            .where(*conditions)
+            .values(
+                turns=VoiceSession.turns + (0 if continuation else 1),
+                last_turn_key=key,
+                conversation_id=func.coalesce(VoiceSession.conversation_id, conversation_id),
+                last_error_code=None,
+                last_error_message=None,
             )
-        except TimeoutError:
-            logger.info("Voice handbook budget exceeded [%s]", request_id)
-    logger.info(
-        "Voice retrieval duration=%dms used=%s [%s]",
-        int((time.monotonic() - retrieval_at) * 1000),
-        bool(passages),
-        request_id,
-    )
+            .execution_options(synchronize_session=False)
+        )
+        if reserved.rowcount == 1:
+            usage_row = AIUsage(
+                owner_id=owner_id,
+                request_type=TOOL_TURN_USAGE if continuation else TURN_USAGE,
+                created_at=now,
+            )
+            db.add(usage_row)
+            await db.commit()
+        else:
+            await db.rollback()
+            await set_transaction_rls_user(db, owner_id)
+            await db.refresh(row)
+            if row.last_turn_key == key:
+                redelivery = True  # a parallel request reserved this same turn
+            elif row.status != "active":
+                return _llm_error(409, "This voice conversation has ended.", "session_ended")
+            else:
+                await _record_error(db, row, "turn_limit")
+                return say(_STUDENT_MESSAGES["turn_limit"])
+    if redelivery:
+        logger.info(
+            f"Voice turn asked again; answering without a new charge [voiceSession={row.id}]"
+        )
+
+    request_id = f"voice-{session_id}-{uuid.uuid4().hex[:12]}"
+    last_user = next((t["content"] for t in reversed(turns) if t["role"] == "user"), "")
+    use_handbook = row.use_handbook and not continuation and _should_use_voice_handbook(last_user)
     student_note = student_context_prompt(
         extra, settings.VOICE_CONVERSATION_MAX_STUDENT_CONTEXT_CHARS
     )
     updates_note = app_updates_prompt(raw_messages)
     logger.info(f"Voice turn messages: {message_role_counts(raw_messages)} [{request_id}]")
-    formatted = (
-        [
-            {"role": "system", "content": LAFINA_SYSTEM_INSTRUCTION},
-            {"role": "system", "content": VOICE_STYLE_INSTRUCTION},
-        ]
-        + ([{"role": "system", "content": student_note}] if student_note else [])
-        + ([{"role": "system", "content": updates_note}] if updates_note else [])
-        + (
-            [
-                {
-                    "role": "system",
-                    "content": build_handbook_prompt(passages, settings.HANDBOOK_TITLE),
-                }
-            ]
-            if passages
-            else []
-        )
-        + turns
-    )
-    events = deepseek.chat_completion_stream(
-        messages=formatted,
-        user_id=str(owner_id),
-        request_id=request_id,
-        max_tokens=settings.VOICE_CONVERSATION_MAX_REPLY_TOKENS,
-        tools=approved_tools or None,
-        sanitize_for_speech=True,
-    )
-    try:
-        first_at = time.monotonic()
-        first = await asyncio.wait_for(anext(events), timeout=12.0)
-        logger.info(
-            "Voice first model event=%dms [%s]",
-            int((time.monotonic() - first_at) * 1000),
-            request_id,
-        )
-    except (DeepSeekError, TimeoutError) as err:
-        if isinstance(err, TimeoutError):
-            err = DeepSeekTimeoutError()
-        code = _provider_error_code(err)
-        logger.warning(f"Voice turn failed before the first words ({code}) [{request_id}]")
-        await _record_error(db, row, code)
-        if code in {"provider_timeout", "provider_unavailable"}:
-
-            async def retry_response():
-                yield _sse(
-                    completion_chunk(
-                        completion_id,
-                        created,
-                        model,
-                        text="I couldn't finish that response. Please try again, or check the card for any action result.",
-                    )
-                )
-                yield _sse(completion_chunk(completion_id, created, model, finish="stop"))
-                yield "data: [DONE]\n\n"
-
-            return StreamingResponse(
-                retry_response(),
-                media_type="text/event-stream",
-                headers={**NO_STORE, "X-Accel-Buffering": "no"},
-            )
-        return _llm_error(err.status_code, _STUDENT_MESSAGES[code], code)
 
     async def save_tokens(usage: dict) -> None:
         prompt = int(usage.get("prompt_tokens", 0) or 0)
         completion = int(usage.get("completion_tokens", 0) or 0)
         await set_transaction_rls_user(db, owner_id)
-        usage_row.prompt_tokens = prompt
-        usage_row.completion_tokens = completion
+        if usage_row is not None:
+            usage_row.prompt_tokens = prompt
+            usage_row.completion_tokens = completion
         await db.execute(
             update(VoiceSession)
             .where(VoiceSession.id == session_id)
@@ -677,51 +627,128 @@ async def voice_llm_turn(
 
     async def settle(work) -> None:
         try:
-            await asyncio.shield(work)
+            await asyncio.shield(asyncio.ensure_future(work))
         except Exception as exc:
-            logger.warning(f"Voice usage could not be saved ({type(exc).__name__}) [{request_id}]")
+            logger.warning(
+                f"Voice bookkeeping could not be saved ({type(exc).__name__}) [{request_id}]"
+            )
+
+    def chunk(**fields) -> str:
+        return _sse(completion_chunk(completion_id, created, model, **fields))
 
     async def stream():
-        pending = first
+        # The first bytes go out at once, before retrieval and DeepSeek, so
+        # ElevenLabs sees the answer start well inside its cascade timeout.
+        yield chunk(text="")
+        passages = []
+        if use_handbook:
+            retrieval_at = time.monotonic()
+            try:
+                passages = await asyncio.wait_for(
+                    _handbook_passages(
+                        handbook,
+                        db,
+                        [ChatMessage(role="user", content=last_user[:4090])],
+                        request_id,
+                    ),
+                    timeout=min(settings.HANDBOOK_TIMEOUT_SECONDS, 2.0),
+                )
+            except TimeoutError:
+                logger.info("Voice handbook budget exceeded [%s]", request_id)
+            logger.info(
+                "Voice retrieval duration=%dms used=%s [%s]",
+                int((time.monotonic() - retrieval_at) * 1000),
+                bool(passages),
+                request_id,
+            )
+        formatted = (
+            [
+                {"role": "system", "content": LAFINA_SYSTEM_INSTRUCTION},
+                {"role": "system", "content": VOICE_STYLE_INSTRUCTION},
+            ]
+            + ([{"role": "system", "content": student_note}] if student_note else [])
+            + ([{"role": "system", "content": updates_note}] if updates_note else [])
+            + (
+                [
+                    {
+                        "role": "system",
+                        "content": build_handbook_prompt(passages, settings.HANDBOOK_TITLE),
+                    }
+                ]
+                if passages
+                else []
+            )
+            + turns
+        )
+        events = deepseek.chat_completion_stream(
+            messages=formatted,
+            user_id=str(owner_id),
+            request_id=request_id,
+            max_tokens=settings.VOICE_CONVERSATION_MAX_REPLY_TOKENS,
+            tools=approved_tools or None,
+            sanitize_for_speech=True,
+        )
         calls_seen = False
-        yield _sse(completion_chunk(completion_id, created, model, text=""))
         try:
+            first_at = time.monotonic()
+            try:
+                pending = await asyncio.wait_for(
+                    anext(events), timeout=settings.VOICE_FIRST_WORDS_TIMEOUT_SECONDS
+                )
+            except (DeepSeekError, TimeoutError, StopAsyncIteration) as err:
+                failure = (
+                    err
+                    if isinstance(err, DeepSeekError)
+                    else (
+                        DeepSeekTimeoutError() if isinstance(err, TimeoutError) else DeepSeekError()
+                    )
+                )
+                code = _provider_error_code(failure)
+                logger.warning(f"Voice turn failed before the first words ({code}) [{request_id}]")
+                await settle(_record_error(db, row, code))
+                yield chunk(
+                    text=TRANSIENT_RETRY
+                    if code in {"provider_timeout", "provider_unavailable"}
+                    else _STUDENT_MESSAGES[code]
+                )
+                yield chunk(finish="stop")
+                yield "data: [DONE]\n\n"
+                return
+            logger.info(
+                "Voice first model event=%dms [%s]",
+                int((time.monotonic() - first_at) * 1000),
+                request_id,
+            )
             while True:
                 kind, value = pending
                 if kind == "delta":
-                    yield _sse(completion_chunk(completion_id, created, model, text=value))
+                    yield chunk(text=value)
                 elif kind == "started":
                     pass
                 elif kind == "tool_calls":
                     calls_seen = True
-                    chunk = completion_chunk(completion_id, created, model)
-                    chunk["choices"][0]["delta"] = {"tool_calls": value}
-                    yield _sse(chunk)
+                    piece = completion_chunk(completion_id, created, model)
+                    piece["choices"][0]["delta"] = {"tool_calls": value}
+                    yield _sse(piece)
                 else:
-                    yield _sse(
-                        completion_chunk(
-                            completion_id,
-                            created,
-                            model,
-                            finish="tool_calls" if calls_seen else "stop",
-                        )
-                    )
+                    yield chunk(finish="tool_calls" if calls_seen else "stop")
                     yield "data: [DONE]\n\n"
-                    await settle(
-                        asyncio.ensure_future(save_tokens(value if isinstance(value, dict) else {}))
-                    )
+                    await settle(save_tokens(value if isinstance(value, dict) else {}))
                     return
                 pending = await asyncio.wait_for(anext(events), timeout=12.0)
         except StopAsyncIteration:
+            yield chunk(finish="tool_calls" if calls_seen else "stop")
             yield "data: [DONE]\n\n"
         except (DeepSeekError, TimeoutError) as err:
             if isinstance(err, TimeoutError):
                 err = DeepSeekTimeoutError()
             code = _provider_error_code(err)
             logger.warning(f"Voice turn stopped part-way ({code}) [{request_id}]")
-            yield _sse({"error": {"message": _STUDENT_MESSAGES[code], "type": code}})
+            await settle(_record_error(db, row, code))
+            # Words, never an error object: an error ends the call.
+            yield chunk(text=MIDSTREAM_APOLOGY)
+            yield chunk(finish="stop")
             yield "data: [DONE]\n\n"
-            await settle(asyncio.ensure_future(_record_error(db, row, code)))
         finally:
             await events.aclose()
 
@@ -729,6 +756,35 @@ async def voice_llm_turn(
         stream(),
         media_type="text/event-stream",
         headers={**NO_STORE, "X-Accel-Buffering": "no"},
+    )
+
+
+SILENCE_CHECK_IN = "I'm still here whenever you're ready."
+NOT_HEARD = "Sorry, I didn't catch that. Could you say it again?"
+TOOL_RESULT_FALLBACK = "I couldn't finish that step. Please check your screen, or say it again."
+TRANSIENT_RETRY = (
+    "I couldn't finish that response. Please try again, or check the card for any action result."
+)
+MIDSTREAM_APOLOGY = " Sorry, I lost my train of thought. Could you say that again?"
+
+
+def _lafina_spoke_last(messages: object) -> bool:
+    for message in reversed(messages if isinstance(messages, list) else []):
+        if isinstance(message, dict) and message.get("role") in ("user", "assistant"):
+            return message.get("role") == "assistant"
+    return False
+
+
+def _spoken_response(completion_id: str, created: int, model: str, text: str) -> StreamingResponse:
+    """A complete, successful answer of one short sentence."""
+
+    async def body():
+        yield _sse(completion_chunk(completion_id, created, model, text=text))
+        yield _sse(completion_chunk(completion_id, created, model, finish="stop"))
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        body(), media_type="text/event-stream", headers={**NO_STORE, "X-Accel-Buffering": "no"}
     )
 
 

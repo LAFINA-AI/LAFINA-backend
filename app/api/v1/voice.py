@@ -133,8 +133,9 @@ class VoiceCapabilitiesResponse(BaseModel):
     provider: str = "elevenlabs"
     enabled: bool
     maxDurationSeconds: int
-    maxTurns: int
-    sessionsPerDay: int
+    # None means no limit.
+    maxTurns: int | None
+    sessionsPerDay: int | None
     detail: str | None = None
 
 
@@ -154,7 +155,7 @@ class VoiceSessionResponse(BaseModel):
     voiceId: str
     expiresAt: str
     maxDurationSeconds: int
-    maxTurns: int
+    maxTurns: int | None
 
 
 class VoiceSessionConnected(BaseModel):
@@ -170,7 +171,7 @@ class VoiceSessionStatus(BaseModel):
     status: str
     endedReason: str | None
     turns: int
-    maxTurns: int
+    maxTurns: int | None
     expiresAt: str
     lastErrorCode: str | None
     lastErrorMessage: str | None
@@ -231,15 +232,17 @@ async def create_voice_session(
     # two devices cannot both pass the daily check.
     await db.execute(select(Account.id).where(Account.id == account.id).with_for_update())
     now = datetime.now(timezone.utc)
-    _, started_today = await _usage_counts(db, account.id, SESSION_USAGE, now)
-    if started_today >= settings.VOICE_CONVERSATION_SESSIONS_PER_DAY:
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail=(
-                f"Daily voice conversation limit reached ({settings.VOICE_CONVERSATION_SESSIONS_PER_DAY} a day). "
-                "Text chat and offline voice still work."
-            ),
-        )
+    daily_sessions = settings.VOICE_CONVERSATION_SESSIONS_PER_DAY
+    if daily_sessions is not None:
+        _, started_today = await _usage_counts(db, account.id, SESSION_USAGE, now)
+        if started_today >= daily_sessions:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=(
+                    f"Daily voice conversation limit reached ({daily_sessions} a day). "
+                    "Text chat and offline voice still work."
+                ),
+            )
 
     voice_id = await _validate_voice(tts, req.voiceId)
     try:
@@ -549,7 +552,8 @@ async def voice_llm_turn(
             if minute_turns >= settings.VOICE_CONVERSATION_TURNS_PER_MIN:
                 await _record_error(db, row, "rate_limited")
                 return say(_STUDENT_MESSAGES["rate_limited"])
-            if day_turns >= settings.VOICE_CONVERSATION_TURNS_PER_DAY:
+            day_cap = settings.VOICE_CONVERSATION_TURNS_PER_DAY
+            if day_cap is not None and day_turns >= day_cap:
                 await _record_error(db, row, "daily_limit")
                 return say(_STUDENT_MESSAGES["daily_limit"])
         # Reserve the turn atomically before paying for it: within budget,
@@ -559,8 +563,9 @@ async def voice_llm_turn(
             VoiceSession.status == "active",
             or_(VoiceSession.last_turn_key.is_(None), VoiceSession.last_turn_key != key),
         ]
-        if not continuation:
-            conditions.append(VoiceSession.turns < settings.VOICE_CONVERSATION_MAX_TURNS)
+        max_turns = settings.VOICE_CONVERSATION_MAX_TURNS
+        if not continuation and max_turns is not None:
+            conditions.append(VoiceSession.turns < max_turns)
         await set_transaction_rls_user(db, owner_id)
         reserved = await db.execute(
             update(VoiceSession)

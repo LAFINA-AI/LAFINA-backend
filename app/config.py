@@ -196,10 +196,12 @@ class Settings(BaseSettings):
     VOICE_CONVERSATION_MAX_SECONDS: int = 300
     # Time allowed between minting the signed URL and the first turn.
     VOICE_CONVERSATION_START_GRACE_SECONDS: int = 120
-    VOICE_CONVERSATION_MAX_TURNS: int = 30
-    VOICE_CONVERSATION_SESSIONS_PER_DAY: int = 6
+    # Conversation counts are unlimited by default (capstone build). Set a
+    # number to cap calls a day, turns a day, or turns in one call again.
+    VOICE_CONVERSATION_MAX_TURNS: Optional[int] = None
+    VOICE_CONVERSATION_SESSIONS_PER_DAY: Optional[int] = None
     VOICE_CONVERSATION_TURNS_PER_MIN: int = 12
-    VOICE_CONVERSATION_TURNS_PER_DAY: int = 150
+    VOICE_CONVERSATION_TURNS_PER_DAY: Optional[int] = None
     # What one turn may send to DeepSeek: recent messages only, bounded.
     VOICE_CONVERSATION_MAX_CONTEXT_MESSAGES: int = 12
     VOICE_CONVERSATION_MAX_CONTEXT_CHARS: int = 6000

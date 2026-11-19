@@ -87,8 +87,9 @@ def world(monkeypatch):
     )
     http = httpx.AsyncClient(transport=httpx.MockTransport(transport))
     monkeypatch.setattr(voice.settings, "ELEVENLABS_AGENT_LLM_SECRET", SecretStr(LLM_SECRET))
-    monkeypatch.setattr(voice.settings, "VOICE_CONVERSATION_SESSIONS_PER_DAY", 6)
-    monkeypatch.setattr(voice.settings, "VOICE_CONVERSATION_MAX_TURNS", 30)
+    monkeypatch.setattr(voice.settings, "VOICE_CONVERSATION_SESSIONS_PER_DAY", None)
+    monkeypatch.setattr(voice.settings, "VOICE_CONVERSATION_MAX_TURNS", None)
+    monkeypatch.setattr(voice.settings, "VOICE_CONVERSATION_TURNS_PER_DAY", None)
     previous = {
         k: getattr(app.state, k, None) for k in ("elevenlabs_agent_client", "elevenlabs_tts_client")
     }
@@ -237,6 +238,41 @@ async def test_daily_session_limit(async_client, world, monkeypatch):
     third = await start(async_client, headers)
     assert third.status_code == 429
     assert "offline voice still work" in third.json()["detail"]
+
+
+def test_conversation_counts_are_unlimited_by_default():
+    defaults = Settings(_env_file=None)
+    assert defaults.VOICE_CONVERSATION_SESSIONS_PER_DAY is None
+    assert defaults.VOICE_CONVERSATION_MAX_TURNS is None
+    assert defaults.VOICE_CONVERSATION_TURNS_PER_DAY is None
+
+
+async def test_no_daily_session_or_turn_limit_when_unset(async_client, world, monkeypatch):
+    # Only the per-minute burst guard stays; lift it so this checks the counts.
+    monkeypatch.setattr(voice.settings, "VOICE_CONVERSATION_TURNS_PER_MIN", 1000)
+    headers = await signed_in(async_client)
+    caps = (await async_client.get("/v1/ai/voice/capabilities", headers=headers)).json()
+    assert caps["sessionsPerDay"] is None and caps["maxTurns"] is None
+    for _ in range(9):  # more than the old six-a-day cap
+        response = await start(async_client, headers)
+        assert response.status_code == 200, response.text
+    session = response.json()
+    assert session["maxTurns"] is None
+    texts: list[str] = []
+    for index in range(32):  # more than the old thirty-turn cap
+        texts.append(f"question {index}")
+        reply = await async_client.post(
+            LLM_PATH, headers=llm_headers(session["grant"]), json=turn_body(*texts)
+        )
+        assert_complete_answer(reply)
+        assert spoken(reply) != voice._STUDENT_MESSAGES["turn_limit"]
+        texts.append("answer")
+    row = await session_row(session["sessionId"])
+    assert row.turns == 32 and row.last_error_code is None
+    status = (
+        await async_client.get(f"/v1/ai/voice/sessions/{session['sessionId']}", headers=headers)
+    ).json()
+    assert status["maxTurns"] is None
 
 
 async def test_new_session_supersedes_the_previous_one(async_client, world):

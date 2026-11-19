@@ -206,6 +206,15 @@ class Settings(BaseSettings):
     # The phone's planner/notes/memories summary sent with each turn (characters).
     VOICE_CONVERSATION_MAX_STUDENT_CONTEXT_CHARS: int = 12000
     VOICE_CONVERSATION_MAX_REPLY_TOKENS: int = 300
+    # One tool round trip (student words, calls, results) may be larger than
+    # the plain-turn context; oversized results are shortened to fit.
+    VOICE_TOOL_EXCHANGE_MAX_MESSAGES: int = 24
+    VOICE_TOOL_EXCHANGE_MAX_CHARS: int = 24000
+    # Longest wait for DeepSeek's first words before LAFINA says a short
+    # apology instead. Keep it under the agent's `cascade_timeout_seconds`
+    # (scripts/provision_voice_agent.py), or ElevenLabs gives up first,
+    # retries, and ends the call after repeated failures.
+    VOICE_FIRST_WORDS_TIMEOUT_SECONDS: float = 9.0
 
     GEMINI_API_KEY: SecretStr | None = None
     GEMINI_BASE_URL: str = "https://generativelanguage.googleapis.com"

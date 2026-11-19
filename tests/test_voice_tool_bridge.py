@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from app.services.voice_conversation import approved_voice_tools, voice_tool_continuation
@@ -48,6 +50,100 @@ def test_continuation_requires_matching_unique_bounded_tool_results():
         )
         == []
     )
+
+
+def test_oversized_results_are_shortened_not_refused():
+    messages = [
+        {"role": "user", "content": "what is on my calendar this week?"},
+        {"role": "assistant", "tool_calls": [call(ident="a"), call(ident="b")]},
+        {"role": "tool", "tool_call_id": "a", "content": '{"title": "Math"}' * 400},
+        {"role": "tool", "tool_call_id": "b", "content": "short"},
+    ]
+    result = voice_tool_continuation(
+        messages, allowed_names={"search_notes"}, max_messages=10, max_chars=3000
+    )
+    assert [m["role"] for m in result] == ["user", "assistant", "tool", "tool"]
+    assert result[2]["content"].endswith("(result shortened)")
+    assert result[3]["content"] == "short"
+    assert len(json.dumps(result, ensure_ascii=False)) <= 3000
+
+
+def test_contextual_updates_and_spoken_words_do_not_break_the_exchange():
+    update = {
+        "id": "u1",
+        "type": "function",
+        "function": {"name": "contextual_update", "arguments": "{}"},
+    }
+    messages = [
+        {"role": "user", "content": "find notes"},
+        {"role": "system", "content": "app update"},
+        {"role": "assistant", "content": "Let me look."},
+        {"role": "assistant", "tool_calls": [call(), update]},
+        {"role": "tool", "tool_call_id": "u1", "content": "app update as a tool"},
+        {"role": "tool", "tool_call_id": "c1", "content": "found"},
+        {"role": "system", "content": "a later app update"},
+    ]
+    result = voice_tool_continuation(
+        messages, allowed_names={"search_notes"}, max_messages=10, max_chars=5000
+    )
+    assert result == [
+        {"role": "user", "content": "find notes"},
+        {"role": "assistant", "content": "Let me look.", "tool_calls": [call()]},
+        {"role": "tool", "tool_call_id": "c1", "content": "found"},
+    ]
+
+
+def test_unanswered_or_unoffered_calls_are_still_refused():
+    base = [{"role": "user", "content": "find notes"}]
+    # A call with no result.
+    assert (
+        voice_tool_continuation(
+            base
+            + [
+                {"role": "assistant", "tool_calls": [call(), call(ident="c2")]},
+                {"role": "tool", "tool_call_id": "c1", "content": "found"},
+            ],
+            allowed_names={"search_notes"},
+            max_messages=10,
+            max_chars=5000,
+        )
+        == []
+    )
+    # Only a call we never offered: nothing of ours to continue.
+    assert (
+        voice_tool_continuation(
+            base
+            + [
+                {"role": "assistant", "tool_calls": [call(name="delete_everything")]},
+                {"role": "tool", "tool_call_id": "c1", "content": "done"},
+            ],
+            allowed_names={"search_notes"},
+            max_messages=10,
+            max_chars=5000,
+        )
+        == []
+    )
+
+
+def test_pending_tool_result_ignores_only_unoffered_calls():
+    from app.services.voice_conversation import pending_tool_result
+
+    user = {"role": "user", "content": "find notes"}
+    ours = [
+        user,
+        {"role": "assistant", "tool_calls": [call()]},
+        {"role": "tool", "tool_call_id": "c1", "content": "x"},
+    ]
+    assert pending_tool_result(ours, {"search_notes"})
+    forged = [user, {"role": "tool", "tool_call_id": "nobody", "content": "x"}]
+    assert pending_tool_result(forged, {"search_notes"})
+    theirs = [
+        user,
+        {"role": "assistant", "tool_calls": [call(name="contextual_update", ident="u")]},
+        {"role": "tool", "tool_call_id": "u", "content": "x"},
+    ]
+    assert not pending_tool_result(theirs, {"search_notes"})
+    assert not pending_tool_result([user], {"search_notes"})
 
 
 def test_agent_config_declares_waiting_client_tools():

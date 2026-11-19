@@ -97,6 +97,7 @@ def student_context_prompt(extra: object, max_chars: int) -> str | None:
     )
 
 
+CONTEXTUAL_UPDATE_TOOL = "contextual_update"
 _APP_UPDATE_OPEN = "<app_update>"
 _APP_UPDATE_CLOSE = "</app_update>"
 
@@ -125,10 +126,28 @@ def app_updates_prompt(
         return None
     started = False
     updates: list[str] = []
+    # ElevenLabs may also record an update as its own `contextual_update`
+    # tool call with the text as the result; read those the same way.
+    update_ids: set[str] = set()
     for message in messages:
         if not isinstance(message, dict):
             continue
         role = message.get("role")
+        if role == "assistant":
+            calls = message.get("tool_calls")
+            for call in calls if isinstance(calls, list) else []:
+                fn = call.get("function") if isinstance(call, dict) else None
+                if (
+                    isinstance(fn, dict)
+                    and fn.get("name") == CONTEXTUAL_UPDATE_TOOL
+                    and isinstance(call.get("id"), str)
+                ):
+                    update_ids.add(call["id"])
+        if role == "tool" and message.get("tool_call_id") in update_ids:
+            text = _clean_note(_text_of(message.get("content")))
+            if any(ch.isalnum() for ch in text):
+                updates.append(text)
+            continue
         if role in ("user", "assistant", "tool"):
             started = True
         elif role == "system" and started:
@@ -288,18 +307,12 @@ def approved_voice_tools(raw: object) -> list[dict]:
     return [allowed[name] for name in names]
 
 
-def voice_tool_continuation(
-    messages: object, *, allowed_names: set[str], max_messages: int, max_chars: int
-) -> list[dict]:
-    """Accept a bounded complete user -> assistant calls -> tool results exchange."""
-    if (
-        not isinstance(messages, list)
-        or not messages
-        or not isinstance(messages[-1], dict)
-        or messages[-1].get("role") != "tool"
-    ):
-        return []
-    start = next(
+MAX_TOOL_RESULT_CHARS = 5000
+_SHORTENED = " …(result shortened)"
+
+
+def _last_user_index(messages: list) -> int:
+    return next(
         (
             i
             for i in range(len(messages) - 1, -1, -1)
@@ -307,29 +320,106 @@ def voice_tool_continuation(
         ),
         -1,
     )
-    if start < 0 or len(messages) - start > max_messages:
+
+
+def _foreign_call_ids(messages: list, allowed_names: set[str]) -> set[str]:
+    """IDs of calls to tools we never offered (for example ElevenLabs' own
+    ``contextual_update`` entries). They and their results are left out."""
+    ids: set[str] = set()
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        calls = msg.get("tool_calls")
+        for call in calls if isinstance(calls, list) else []:
+            fn = call.get("function") if isinstance(call, dict) else None
+            name = fn.get("name") if isinstance(fn, dict) else None
+            if (
+                isinstance(call, dict)
+                and isinstance(call.get("id"), str)
+                and name not in allowed_names
+            ):
+                ids.add(call["id"])
+    return ids
+
+
+def pending_tool_result(messages: object, allowed_names: set[str]) -> bool:
+    """True when a tool result for one of our tools arrived after the student's
+    latest words. Such a request must be answered as a tool continuation (or
+    with a spoken fallback), never by re-answering the student's words, which
+    would run the same tool again."""
+    if not isinstance(messages, list):
+        return False
+    start = _last_user_index(messages)
+    foreign = _foreign_call_ids(messages, allowed_names)
+    return any(
+        isinstance(msg, dict)
+        and msg.get("role") == "tool"
+        and msg.get("tool_call_id") not in foreign
+        for msg in messages[start + 1 :]
+    )
+
+
+def voice_tool_continuation(
+    messages: object, *, allowed_names: set[str], max_messages: int, max_chars: int
+) -> list[dict]:
+    """A bounded user -> assistant calls -> tool results exchange, or [].
+
+    ElevenLabs does not send this exchange in one fixed shape, and a request
+    refused here used to end the whole call (ElevenLabs retries the same
+    request, then hangs up). So the shapes a live call really produces are
+    accepted: spoken words before a call (folded into the call's message),
+    the phone's contextual updates (system messages, carried separately by
+    ``app_updates_prompt``) and calls to tools we never offered (dropped with
+    their results). Oversized results are shortened instead of refused. What
+    stays strict: every call is one we offered with a JSON object for
+    arguments, call IDs are unique, and every call has exactly one result.
+    """
+    if not isinstance(messages, list) or not messages:
         return []
-    exchange = messages[start:]
-    if len(json.dumps(exchange, ensure_ascii=False)) > max_chars:
+    tail = len(messages)
+    while (
+        tail and isinstance(messages[tail - 1], dict) and messages[tail - 1].get("role") == "system"
+    ):
+        tail -= 1
+    if (
+        not tail
+        or not isinstance(messages[tail - 1], dict)
+        or messages[tail - 1].get("role") != "tool"
+    ):
         return []
-    user = _text_of(exchange[0].get("content"))
+    start = _last_user_index(messages[:tail])
+    if start < 0:
+        return []
+    user = _text_of(messages[start].get("content"))
     if not user.strip():
         return []
-    clean = [{"role": "user", "content": user}]
+    foreign = _foreign_call_ids(messages[start:tail], allowed_names)
+    clean: list[dict] = [{"role": "user", "content": user}]
     pending: set[str] = set()
     used: set[str] = set()
-    for msg in exchange[1:]:
+    words: list[str] = []
+    for msg in messages[start + 1 : tail]:
         if not isinstance(msg, dict):
             return []
-        if msg.get("role") == "assistant" and not pending:
+        role = msg.get("role")
+        if role == "system":
+            continue
+        if role == "assistant":
+            text = " ".join(_text_of(msg.get("content")).split())
+            if text:
+                words.append(text)
             calls = msg.get("tool_calls")
-            if not isinstance(calls, list) or not 1 <= len(calls) <= 5:
+            if calls is None or calls == []:
+                continue
+            if not isinstance(calls, list) or len(calls) > 5:
                 return []
             normalized = []
             for call in calls:
-                if not isinstance(call, dict) or call.get("type") != "function":
+                if not isinstance(call, dict) or call.get("type", "function") != "function":
                     return []
                 ident, fn = call.get("id"), call.get("function")
+                if ident in foreign:
+                    continue
                 if (
                     not isinstance(ident, str)
                     or not 0 < len(ident) <= 200
@@ -352,35 +442,69 @@ def voice_tool_continuation(
                 if not isinstance(parsed, dict):
                     return []
                 used.add(ident)
-                pending.add(ident)
                 normalized.append(
                     {"id": ident, "type": "function", "function": {"name": name, "arguments": args}}
                 )
-            clean.append({"role": "assistant", "content": None, "tool_calls": normalized})
-        elif (
-            msg.get("role") == "tool"
-            and isinstance(msg.get("tool_call_id"), str)
-            and msg.get("tool_call_id") in pending
-        ):
-            content = msg.get("content")
-            if not isinstance(content, str) or len(content) > 5000:
+            if not normalized:
+                continue
+            if pending:
+                return []  # new calls before the earlier ones were answered
+            pending.update(call["id"] for call in normalized)
+            clean.append(
+                {"role": "assistant", "content": " ".join(words) or None, "tool_calls": normalized}
+            )
+            words = []
+        elif role == "tool":
+            ident = msg.get("tool_call_id")
+            if ident in foreign:
+                continue
+            if not isinstance(ident, str) or ident not in pending:
                 return []
-            ident = msg["tool_call_id"]
+            raw = msg.get("content")
+            content = raw if isinstance(raw, str) else _text_of(raw)
+            if len(content) > MAX_TOOL_RESULT_CHARS:
+                content = content[: MAX_TOOL_RESULT_CHARS - len(_SHORTENED)] + _SHORTENED
             pending.remove(ident)
             clean.append({"role": "tool", "tool_call_id": ident, "content": content})
         else:
             return []
-    return clean if not pending else []
+    if pending or len(clean) < 3 or clean[-1]["role"] != "tool" or len(clean) > max_messages:
+        return []
+    return _fit_tool_results(clean, max_chars)
 
 
-def turn_key(conversation_id: str | None, raw_message_count: int, last_user_text: str) -> str:
-    """Same conversation, same history length, same words: the same turn."""
+def _fit_tool_results(clean: list[dict], max_chars: int) -> list[dict]:
+    """Shorten tool results evenly so the exchange fits; [] when it cannot."""
+    if len(json.dumps(clean, ensure_ascii=False)) <= max_chars:
+        return clean
+    results = [m for m in clean if m["role"] == "tool"]
+    overhead = len(json.dumps([{**m, "content": ""} if m["role"] == "tool" else m for m in clean]))
+    # JSON escaping can grow text; leave a margin for it.
+    share = (max_chars - overhead) // len(results) * 3 // 4
+    if share < 200:
+        return []
+    fitted = [
+        {**m, "content": m["content"][: share - len(_SHORTENED)] + _SHORTENED}
+        if m["role"] == "tool" and len(m["content"]) > share
+        else m
+        for m in clean
+    ]
+    return fitted if len(json.dumps(fitted, ensure_ascii=False)) <= max_chars else []
+
+
+def turn_key(conversation_id: str | None, raw_message_count: int) -> str:
+    """Same conversation and same history length: the same turn.
+
+    The words are left out on purpose. ElevenLabs asks again for one turn in
+    two ways: a retry of the identical request after a slow or failed
+    attempt, and a speculative request sent before the student finished,
+    followed by the final one with fuller words. Both are the same turn, are
+    paid once, and are answered every time.
+    """
     digest = hashlib.sha256()
     digest.update((conversation_id or "-").encode())
     digest.update(b"\0")
     digest.update(str(raw_message_count).encode())
-    digest.update(b"\0")
-    digest.update(last_user_text.encode())
     return digest.hexdigest()
 
 

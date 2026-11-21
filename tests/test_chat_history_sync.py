@@ -428,3 +428,111 @@ async def test_chat_is_isolated_between_accounts(async_client: AsyncClient) -> N
     await async_client.post("/v1/sync/chat/purge", headers=bob)
     alice_view = await _batch(async_client, alice, [])
     assert {item["operation"] for item in alice_view["changes"]} == {"create"}
+
+
+@pytest.mark.asyncio
+async def test_an_account_keeps_at_most_twenty_chats(async_client: AsyncClient) -> None:
+    headers = await _register(async_client, "chat-limit@ustp.edu.ph")
+    limit = sync_api.MAX_CHAT_SESSIONS_PER_ACCOUNT
+    assert limit == 20
+    full = [
+        _mutation(f"s-{n}", "chat_session", f"chat_session:c{n}", _session(f"Chat {n}"))
+        for n in range(limit)
+    ]
+    data = await _batch(async_client, headers, full)
+    assert len(data["accepted"]) == limit and data["rejected"] == []
+
+    # A 21st chat, by session or by a message into a new chat, is refused.
+    data = await _batch(
+        async_client,
+        headers,
+        [
+            _mutation("s-extra", "chat_session", "chat_session:extra", _session()),
+            _mutation(
+                "m-extra",
+                "chat_message",
+                "msg_extra",
+                _message(session_id="chat_session:other"),
+            ),
+        ],
+    )
+    assert [r["reason"] for r in data["rejected"]] == [
+        sync_api.CHAT_LIMIT_REASON,
+        sync_api.CHAT_LIMIT_REASON,
+    ]
+    assert data["accepted"] == []
+    feed_ids = {c["entityId"] for c in data["changes"]}
+    assert "chat_session:extra" not in feed_ids
+    assert "chat_session:other" not in feed_ids
+    assert "msg_extra" not in feed_ids
+
+    # Existing chats still take messages and renames.
+    data = await _batch(
+        async_client,
+        headers,
+        [
+            _mutation("m-ok", "chat_message", "msg_ok", _message(session_id="chat_session:c0")),
+            _mutation(
+                "s-rename",
+                "chat_session",
+                "chat_session:c1",
+                _session("Renamed"),
+                operation="update",
+            ),
+        ],
+    )
+    assert data["rejected"] == [] and len(data["accepted"]) == 2
+
+    # Deleting one makes room; restoring a deleted chat counts as adding one.
+    data = await _batch(
+        async_client,
+        headers,
+        [
+            _mutation("d-0", "chat_session", "chat_session:c0", {}, operation="delete"),
+            _mutation("s-new", "chat_session", "chat_session:new", _session()),
+            _mutation("s-revive", "chat_session", "chat_session:c0", _session()),
+        ],
+    )
+    assert [r["mutationId"] for r in data["accepted"]] == ["d-0", "s-new"]
+    assert [(r["mutationId"], r["reason"]) for r in data["rejected"]] == [
+        ("s-revive", sync_api.CHAT_LIMIT_REASON)
+    ]
+
+    # A retried rejected mutation gets the same answer, not a new chat.
+    data = await _batch(
+        async_client,
+        headers,
+        [_mutation("s-extra", "chat_session", "chat_session:extra", _session())],
+    )
+    assert data["rejected"][0]["reason"] == sync_api.CHAT_LIMIT_REASON
+
+
+@pytest.mark.asyncio
+async def test_the_chat_limit_is_per_account(async_client: AsyncClient) -> None:
+    first = await _register(async_client, "chat-limit-a@ustp.edu.ph")
+    second = await _register(async_client, "chat-limit-b@ustp.edu.ph")
+    limit = sync_api.MAX_CHAT_SESSIONS_PER_ACCOUNT
+    await _batch(
+        async_client,
+        first,
+        [
+            _mutation(f"a-{n}", "chat_session", f"chat_session:a{n}", _session())
+            for n in range(limit)
+        ],
+    )
+    data = await _batch(
+        async_client,
+        second,
+        [_mutation("b-1", "chat_session", "chat_session:b1", _session())],
+    )
+    assert data["rejected"] == [] and len(data["accepted"]) == 1
+
+    # Purging the chat history frees the whole allowance.
+    purge = await async_client.post("/v1/sync/chat/purge", headers=first)
+    assert purge.status_code == 200
+    data = await _batch(
+        async_client,
+        first,
+        [_mutation("a-new", "chat_session", "chat_session:anew", _session())],
+    )
+    assert data["rejected"] == []

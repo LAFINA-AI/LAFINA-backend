@@ -273,6 +273,10 @@ class RecordedMeetingPayload(BaseModel):
 # the phone that holds them: only their description is synchronized.
 MAX_CHAT_MESSAGE_CHARS = 100_000
 USTP_CHAT_PREFIX = "chat_session:ustp_"
+# An account keeps at most this many chats. A write that would add one more
+# is rejected with CHAT_LIMIT_REASON; the phone keeps that chat locally.
+MAX_CHAT_SESSIONS_PER_ACCOUNT = 20
+CHAT_LIMIT_REASON = "chat_limit_reached"
 
 
 class ChatSessionPayload(BaseModel):
@@ -901,6 +905,58 @@ async def _live_chat_messages(
     return list(result.scalars().all())
 
 
+async def _chat_session_is_live(
+    db: AsyncSession,
+    owner_id: uuid.UUID,
+    session_id: str,
+) -> bool:
+    result = await db.execute(
+        select(ChatSessionsSync.client_id).where(
+            ChatSessionsSync.owner_id == owner_id,
+            ChatSessionsSync.client_id == session_id,
+            ChatSessionsSync.deleted_at.is_(None),
+        )
+    )
+    return result.first() is not None
+
+
+async def _chat_limit_reached(
+    db: AsyncSession,
+    owner_id: uuid.UUID,
+    mutation: SyncMutation,
+    existing_entity: ChatSessionsSync | ChatMessagesSync | None,
+) -> bool:
+    """True when this write would add a chat to an account that has the most.
+
+    A chat is added by creating or restoring a session, or by a message
+    written into a session that is missing or deleted. Batches of one owner
+    are serialized (the sync-head lock), so the count cannot race.
+    """
+    if mutation.operation == "delete":
+        return False
+    if mutation.entityType == "chat_session":
+        adds_chat = (
+            existing_entity is None or existing_entity.deleted_at is not None
+        )
+    else:
+        session_id = _chat_message_session_id(mutation)
+        adds_chat = session_id is not None and not await _chat_session_is_live(
+            db, owner_id, session_id
+        )
+    if not adds_chat:
+        return False
+    await db.flush()
+    live = await db.execute(
+        select(func.count())
+        .select_from(ChatSessionsSync)
+        .where(
+            ChatSessionsSync.owner_id == owner_id,
+            ChatSessionsSync.deleted_at.is_(None),
+        )
+    )
+    return int(live.scalar_one()) >= MAX_CHAT_SESSIONS_PER_ACCOUNT
+
+
 async def _ensure_chat_session(
     db: AsyncSession,
     owner_id: uuid.UUID,
@@ -1149,6 +1205,21 @@ async def sync_batch(
                 db, owner_id, mut, already_deleted_result
             )
             accepted_results.append(already_deleted_result)
+            continue
+
+        if mut.entityType in CHAT_ENTITY_TYPES and await _chat_limit_reached(
+            db, owner_id, mut, existing_entity
+        ):
+            limit_result = MutationResult(
+                mutationId=mut.mutationId,
+                entityType=mut.entityType,
+                entityId=mut.entityId,
+                status="rejected",
+                reason=CHAT_LIMIT_REASON,
+                serverVersion=server_version,
+            )
+            await _record_terminal_result(db, owner_id, mut, limit_result)
+            rejected_results.append(limit_result)
             continue
 
         # Deleting a chat deletes its messages first, so the feed removes the

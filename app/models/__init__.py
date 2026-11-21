@@ -6,6 +6,7 @@ from app.models.synchronized_content import (
     RemindersSync, NotesSync, CustomCategoriesSync,
     PomodoroSettingsSync, PomodoroSessionsSync, FlashcardDecksSync,
     StudySummariesSync, RecordedMeetingsSync,
+    ChatSessionsSync, ChatMessagesSync,
 )
 from app.models.mutations import IdempotentMutation
 from app.models.change_feed import ChangeFeed
@@ -30,6 +31,8 @@ __all__ = [
     "FlashcardDecksSync",
     "StudySummariesSync",
     "RecordedMeetingsSync",
+    "ChatSessionsSync",
+    "ChatMessagesSync",
     "IdempotentMutation",
     "ChangeFeed",
     "SyncHead",

@@ -30,6 +30,8 @@ ALL_TYPES = [
     "flashcard_deck",
     "study_summary",
     "recorded_meeting",
+    "chat_session",
+    "chat_message",
 ]
 STAMP = "2026-09-19T10:00:00+08:00"
 
@@ -307,8 +309,10 @@ async def test_snapshot_only_covers_declared_types(async_client: AsyncClient) ->
         "flashcard_deck",
         "study_summary",
         "recorded_meeting",
+        "chat_session",
+        "chat_message",
     ]
-    types = {item["entityType"] for item in declared["items"]}
+    types ={item["entityType"] for item in declared["items"]}
     assert {"task", "flashcard_deck", "pomodoro_settings"} <= types
     assert declared["boundaryCursor"] == legacy["boundaryCursor"]
 

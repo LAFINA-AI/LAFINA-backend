@@ -76,6 +76,7 @@ def test_alembic_revision_chain_is_linear_and_free_of_business_schema_creation()
         "011_study_tools_sync",
         "012_remove_business_and_gmail",
         "013_voice_sessions",
+        "014_chat_history_sync",
     ]
 
 

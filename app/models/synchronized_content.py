@@ -139,3 +139,27 @@ class RecordedMeetingsSync(Base):
     payload: Mapped[dict] = mapped_column(JSON, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+class ChatSessionsSync(Base):
+    """One chat conversation. Its messages live in `chat_messages_sync`."""
+    __tablename__ = "chat_sessions_sync"
+
+    owner_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    client_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    version: Mapped[int] = mapped_column(BigInteger, default=1, nullable=False)
+    change_id: Mapped[int] = mapped_column(BigInteger, index=True, nullable=False)
+    payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+class ChatMessagesSync(Base):
+    """One chat message. `payload.session_id` names its `chat_sessions_sync` row."""
+    __tablename__ = "chat_messages_sync"
+
+    owner_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    client_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    version: Mapped[int] = mapped_column(BigInteger, default=1, nullable=False)
+    change_id: Mapped[int] = mapped_column(BigInteger, index=True, nullable=False)
+    payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

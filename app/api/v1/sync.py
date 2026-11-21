@@ -11,7 +11,7 @@ from pydantic import (
     field_validator,
     model_validator,
 )
-from sqlalchemy import func, select, text
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
@@ -25,6 +25,7 @@ from app.models.synchronized_content import (
     RemindersSync, NotesSync, CustomCategoriesSync,
     PomodoroSettingsSync, PomodoroSessionsSync, FlashcardDecksSync,
     StudySummariesSync, RecordedMeetingsSync,
+    ChatSessionsSync, ChatMessagesSync,
 )
 from app.security.auth import get_current_user_and_session
 
@@ -267,10 +268,55 @@ class RecordedMeetingPayload(BaseModel):
         return value
 
 
+# Chat history. A conversation is a `chat_session`; each message is a
+# `chat_message` naming its session. Files attached to a message never leave
+# the phone that holds them: only their description is synchronized.
+MAX_CHAT_MESSAGE_CHARS = 100_000
+USTP_CHAT_PREFIX = "chat_session:ustp_"
+
+
+class ChatSessionPayload(BaseModel):
+    """A conversation. An empty title means "name it after the first message"."""
+    model_config = ConfigDict(extra="forbid")
+    title: str = Field("", max_length=128)
+    kind: Literal["general", "ustp"] = "general"
+    created_at: str = Field(..., max_length=64)
+
+
+class ChatAttachmentPayload(BaseModel):
+    """What a file was, never where it is: the file stays on its phone."""
+    model_config = ConfigDict(extra="forbid")
+    file_name: str = Field(..., max_length=255)
+    format: str = Field("", max_length=32)
+    mime_type: str = Field("", max_length=128)
+    size_bytes: int = Field(0, ge=0)
+
+
+class ChatReviewResolutionPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["confirmed", "cancelled"]
+    summary: str | None = Field(None, max_length=2000)
+    resolved_at: str | None = Field(None, max_length=64)
+
+
+class ChatMessagePayload(BaseModel):
+    """One message. Device-only notes (memory Undo) are not part of it."""
+    model_config = ConfigDict(extra="forbid")
+    session_id: str = Field(..., min_length=1, max_length=128)
+    sender: Literal["user", "assistant"]
+    content: str = Field(..., max_length=MAX_CHAT_MESSAGE_CHARS)
+    created_at: str = Field(..., max_length=64)
+    handbook_note: str | None = Field(None, max_length=2000)
+    local_reply: bool = False
+    voice_interrupted: bool = False
+    review_resolution: ChatReviewResolutionPayload | None = None
+    attachment: ChatAttachmentPayload | None = None
+
+
 EntityType = Literal[
     "profile", "task", "event", "time_block", "reminder", "note", "custom_category",
     "pomodoro_settings", "pomodoro_session", "flashcard_deck", "study_summary",
-    "recorded_meeting",
+    "recorded_meeting", "chat_session", "chat_message",
 ]
 OperationType = Literal["create", "update", "delete"]
 
@@ -283,6 +329,11 @@ LEGACY_ENTITY_TYPES: tuple[EntityType, ...] = (
 )
 # Per-account singletons: updated in place, never deleted.
 SINGLETON_ENTITY_TYPES: frozenset[str] = frozenset({"profile", "pomodoro_settings"})
+# Chat rows: a delete clears the stored text and the change feed's older
+# copies of it, deleting a session deletes its messages, and an edit that
+# arrives after a delete does not bring the row back.
+CHAT_ENTITY_TYPES: frozenset[str] = frozenset({"chat_session", "chat_message"})
+CHAT_SCRUB_CHUNK = 500
 
 class SyncMutation(BaseModel):
     mutationId: str = Field(..., max_length=128)
@@ -403,6 +454,8 @@ MODEL_MAP = {
     "flashcard_deck": FlashcardDecksSync,
     "study_summary": StudySummariesSync,
     "recorded_meeting": RecordedMeetingsSync,
+    "chat_session": ChatSessionsSync,
+    "chat_message": ChatMessagesSync,
 }
 
 PAYLOAD_VALIDATOR_MAP = {
@@ -418,6 +471,8 @@ PAYLOAD_VALIDATOR_MAP = {
     "flashcard_deck": FlashcardDeckPayload,
     "study_summary": StudySummaryPayload,
     "recorded_meeting": RecordedMeetingPayload,
+    "chat_session": ChatSessionPayload,
+    "chat_message": ChatMessagePayload,
 }
 
 FORBIDDEN_KEYS = {"owner_id", "role", "password_hash", "entitlements", "ai_limit", "server_timestamp"}
@@ -435,6 +490,9 @@ SNAPSHOT_MODEL_ORDER = (
     ("flashcard_deck", FlashcardDecksSync),
     ("study_summary", StudySummariesSync),
     ("recorded_meeting", RecordedMeetingsSync),
+    # Sessions before messages, so a restoring phone sees a chat before its text.
+    ("chat_session", ChatSessionsSync),
+    ("chat_message", ChatMessagesSync),
 )
 SNAPSHOT_AUTHORITATIVE_ENTITY_TYPES: list[EntityType] = [
     "task",
@@ -447,6 +505,8 @@ SNAPSHOT_AUTHORITATIVE_ENTITY_TYPES: list[EntityType] = [
     "flashcard_deck",
     "study_summary",
     "recorded_meeting",
+    "chat_session",
+    "chat_message",
 ]
 SUPPORTED_ENTITY_TYPES: list[EntityType] = [
     entity_type for entity_type, _ in SNAPSHOT_MODEL_ORDER
@@ -713,8 +773,23 @@ async def _lock_batch_mutations(
         f"entity:{owner_key}:{mutation.entityType}:{mutation.entityId}"
         for mutation in mutations
     )
+    # A message write and a delete of its session are serialized, so the
+    # session cascade cannot miss a message written at the same moment.
+    lock_keys.update(
+        f"entity:{owner_key}:chat_session:{_chat_message_session_id(mutation)}"
+        for mutation in mutations
+        if mutation.entityType == "chat_message"
+        and _chat_message_session_id(mutation)
+    )
     if mutations:
         lock_keys.add(f"sync-head:{owner_key}")
+    await _advisory_locks(db, lock_keys)
+
+
+async def _advisory_locks(db: AsyncSession, lock_keys: set[str]) -> None:
+    """Take transaction-scoped PostgreSQL advisory locks in a stable order."""
+    if db.get_bind().dialect.name != "postgresql":
+        return
     for lock_key in sorted(lock_keys):
         await db.execute(
             text(
@@ -724,6 +799,166 @@ async def _lock_batch_mutations(
             ),
             {"lock_key": lock_key},
         )
+
+
+def _chat_message_session_id(mutation: SyncMutation) -> str | None:
+    """The session a chat message mutation names, if it names a usable one."""
+    value = mutation.payload.get("session_id")
+    return value if isinstance(value, str) and 0 < len(value) <= 128 else None
+
+
+def _chat_session_kind(session_id: str) -> Literal["general", "ustp"]:
+    return "ustp" if session_id.startswith(USTP_CHAT_PREFIX) else "general"
+
+
+async def _scrub_superseded_chat_changes(
+    db: AsyncSession,
+    owner_id: uuid.UUID,
+    entity_type: str,
+    entity_ids: list[str],
+    before_change_id: int,
+) -> None:
+    """Drop the change feed's older copies of deleted chat rows.
+
+    Deleted chat text should not stay on the server. Each row's delete change
+    is kept, so a client behind the cursor still learns of the delete; only the
+    superseded changes that carried the old text are removed.
+    """
+    for start in range(0, len(entity_ids), CHAT_SCRUB_CHUNK):
+        chunk = entity_ids[start:start + CHAT_SCRUB_CHUNK]
+        await db.execute(
+            delete(ChangeFeed).where(
+                ChangeFeed.owner_id == owner_id,
+                ChangeFeed.entity_type == entity_type,
+                ChangeFeed.entity_id.in_(chunk),
+                ChangeFeed.change_id < before_change_id,
+            )
+        )
+
+
+async def _tombstone_chat_rows(
+    db: AsyncSession,
+    owner_id: uuid.UUID,
+    entity_type: str,
+    rows: list,
+    now: datetime,
+) -> int:
+    """Delete live chat rows in bulk: one delete change each, text cleared."""
+    if not rows:
+        return 0
+    records = [
+        ChangeFeed(
+            owner_id=owner_id,
+            entity_type=entity_type,
+            entity_id=row.client_id,
+            operation="delete",
+            version=row.version + 1,
+            payload={},
+            created_at=now,
+        )
+        for row in rows
+    ]
+    db.add_all(records)
+    await db.flush()
+    for row, record in zip(rows, records):
+        row.version = record.version
+        row.change_id = record.change_id
+        row.payload = {}
+        row.updated_at = now
+        row.deleted_at = now
+    change_ids = [record.change_id for record in records]
+    await _advance_sync_head(db, owner_id, max(change_ids), now)
+    await _scrub_superseded_chat_changes(
+        db,
+        owner_id,
+        entity_type,
+        [row.client_id for row in rows],
+        min(change_ids),
+    )
+    await db.flush()
+    return len(rows)
+
+
+async def _live_chat_messages(
+    db: AsyncSession,
+    owner_id: uuid.UUID,
+    session_id: str | None = None,
+) -> list[ChatMessagesSync]:
+    conditions = [
+        ChatMessagesSync.owner_id == owner_id,
+        ChatMessagesSync.deleted_at.is_(None),
+    ]
+    if session_id is not None:
+        conditions.append(
+            ChatMessagesSync.payload["session_id"].as_string() == session_id
+        )
+    result = await db.execute(
+        select(ChatMessagesSync)
+        .where(*conditions)
+        .order_by(ChatMessagesSync.client_id.asc())
+        .with_for_update()
+    )
+    return list(result.scalars().all())
+
+
+async def _ensure_chat_session(
+    db: AsyncSession,
+    owner_id: uuid.UUID,
+    session_id: str,
+    created_at: str,
+    now: datetime,
+) -> None:
+    """Give a written message a live session, creating or restoring it.
+
+    A message written on an offline phone into a chat another phone deleted
+    brings that chat back (untitled), so no phone holds a message without one.
+    """
+    result = await db.execute(
+        select(ChatSessionsSync)
+        .where(
+            ChatSessionsSync.owner_id == owner_id,
+            ChatSessionsSync.client_id == session_id,
+        )
+        .with_for_update()
+    )
+    session_row = result.scalar_one_or_none()
+    if session_row is not None and session_row.deleted_at is None:
+        return
+    payload = ChatSessionPayload(
+        title="",
+        kind=_chat_session_kind(session_id),
+        created_at=created_at,
+    ).model_dump()
+    version = (session_row.version if session_row is not None else 0) + 1
+    record = ChangeFeed(
+        owner_id=owner_id,
+        entity_type="chat_session",
+        entity_id=session_id,
+        operation="create" if session_row is None else "update",
+        version=version,
+        payload=payload,
+        created_at=now,
+    )
+    db.add(record)
+    await db.flush()
+    await _advance_sync_head(db, owner_id, record.change_id, now)
+    if session_row is None:
+        db.add(ChatSessionsSync(
+            owner_id=owner_id,
+            client_id=session_id,
+            version=version,
+            change_id=record.change_id,
+            payload=payload,
+            updated_at=now,
+            deleted_at=None,
+        ))
+    else:
+        session_row.payload = payload
+        session_row.version = version
+        session_row.change_id = record.change_id
+        session_row.updated_at = now
+        session_row.deleted_at = None
+    await db.flush()
 
 
 def _restore_idempotent_result(
@@ -893,6 +1128,41 @@ async def sync_batch(
             rejected_results.append(conflict_result)
             continue
 
+        # A chat edit or delete that reaches a row already deleted (on another
+        # phone) changes nothing: the delete wins. A `create` still restores
+        # it, which is how a phone re-uploads its own history.
+        if (
+            mut.entityType in CHAT_ENTITY_TYPES
+            and mut.operation != "create"
+            and existing_entity is not None
+            and existing_entity.deleted_at is not None
+        ):
+            already_deleted_result = MutationResult(
+                mutationId=mut.mutationId,
+                entityType=mut.entityType,
+                entityId=mut.entityId,
+                status="accepted",
+                reason="already_deleted",
+                serverVersion=existing_entity.version,
+            )
+            await _record_terminal_result(
+                db, owner_id, mut, already_deleted_result
+            )
+            accepted_results.append(already_deleted_result)
+            continue
+
+        # Deleting a chat deletes its messages first, so the feed removes the
+        # text before the chat that held it.
+        if mut.entityType == "chat_session" and mut.operation == "delete":
+            await db.flush()
+            await _tombstone_chat_rows(
+                db,
+                owner_id,
+                "chat_message",
+                await _live_chat_messages(db, owner_id, mut.entityId),
+                now,
+            )
+
         new_version = server_version + 1
         change_payload = {} if mut.operation == "delete" else validated_payload
         change_record = ChangeFeed(
@@ -943,6 +1213,23 @@ async def sync_batch(
                     updated_at=now,
                     deleted_at=None
                 ))
+
+        if mut.entityType in CHAT_ENTITY_TYPES:
+            if mut.operation == "delete":
+                if existing_entity:
+                    existing_entity.payload = {}
+                await db.flush()
+                await _scrub_superseded_chat_changes(
+                    db, owner_id, mut.entityType, [mut.entityId], new_change_id
+                )
+            elif mut.entityType == "chat_message":
+                await _ensure_chat_session(
+                    db,
+                    owner_id,
+                    validated_payload["session_id"],
+                    validated_payload["created_at"],
+                    now,
+                )
 
         accepted_result = MutationResult(
             mutationId=mut.mutationId,
@@ -1035,4 +1322,49 @@ async def sync_batch(
         resetRequired=False,
         serverTime=now_str,
         supportedEntityTypes=SUPPORTED_ENTITY_TYPES,
+    )
+
+
+class ChatPurgeResponse(BaseModel):
+    deletedSessions: int
+    deletedMessages: int
+    serverTime: str
+
+
+@router.post("/chat/purge", response_model=ChatPurgeResponse)
+async def purge_chat_history(
+    auth_data: Annotated[tuple[Account, AuthSession], Depends(get_current_user_and_session)],
+    db: AsyncSession = Depends(get_db),
+) -> ChatPurgeResponse:
+    """Delete this account's synchronized chat history from the server.
+
+    Every chat and message becomes a delete in the change feed with its text
+    cleared, so phones that sync chat history remove them too. Nothing else
+    the account synchronizes is touched.
+    """
+    account, _ = auth_data
+    owner_id = account.id
+    now = datetime.now(timezone.utc)
+    owner_key = str(owner_id)
+    await _advisory_locks(db, {f"sync-head:{owner_key}"})
+
+    deleted_messages = await _tombstone_chat_rows(
+        db, owner_id, "chat_message", await _live_chat_messages(db, owner_id), now
+    )
+    session_result = await db.execute(
+        select(ChatSessionsSync)
+        .where(
+            ChatSessionsSync.owner_id == owner_id,
+            ChatSessionsSync.deleted_at.is_(None),
+        )
+        .order_by(ChatSessionsSync.client_id.asc())
+        .with_for_update()
+    )
+    deleted_sessions = await _tombstone_chat_rows(
+        db, owner_id, "chat_session", list(session_result.scalars().all()), now
+    )
+    return ChatPurgeResponse(
+        deletedSessions=deleted_sessions,
+        deletedMessages=deleted_messages,
+        serverTime=now.isoformat(),
     )

@@ -137,6 +137,8 @@ class VoiceCapabilitiesResponse(BaseModel):
     maxTurns: int | None
     sessionsPerDay: int | None
     detail: str | None = None
+    # The agent accepts the app's opening line (first_message override).
+    openingLine: bool = False
 
 
 class VoiceSessionRequest(BaseModel):
@@ -191,6 +193,7 @@ async def voice_capabilities(
         maxTurns=settings.VOICE_CONVERSATION_MAX_TURNS,
         sessionsPerDay=settings.VOICE_CONVERSATION_SESSIONS_PER_DAY,
         detail=None if enabled else "Voice conversation is not set up on this server yet.",
+        openingLine=enabled and settings.VOICE_OPENING_LINE_OVERRIDE,
     )
 
 

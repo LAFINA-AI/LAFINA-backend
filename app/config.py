@@ -196,6 +196,11 @@ class Settings(BaseSettings):
     VOICE_CONVERSATION_MAX_SECONDS: int = 300
     # Time allowed between minting the signed URL and the first turn.
     VOICE_CONVERSATION_START_GRACE_SECONDS: int = 120
+    # The app may choose the call's opening line (tone, name, time of day).
+    # Turn on only after the agent allows its first_message override
+    # (scripts/provision_voice_agent.py --allow-opening-line --apply): an
+    # override the agent does not allow makes ElevenLabs refuse the call.
+    VOICE_OPENING_LINE_OVERRIDE: bool = False
     # Conversation counts are unlimited by default (capstone build). Set a
     # number to cap calls a day, turns a day, or turns in one call again.
     VOICE_CONVERSATION_MAX_TURNS: Optional[int] = None

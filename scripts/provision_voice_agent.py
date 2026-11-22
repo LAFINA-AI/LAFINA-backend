@@ -87,6 +87,25 @@ def reliability_patch(args) -> dict:
     }
 
 
+def agent_overrides() -> dict:
+    """What the app may set per call: the voice, the opening line, and the
+    grant. Nothing else; the prompt, tools, LLM and language stay server-owned."""
+    return {
+        "conversation_config_override": {
+            "tts": {"voice_id": True},
+            # Call Lafina's greeting (tone, name, time of day); empty for an
+            # answered reminder call, whose reminder the app already read.
+            "agent": {"first_message": True},
+        },
+        "custom_llm_extra_body": True,
+    }
+
+
+def opening_line_patch() -> dict:
+    """Only the override permissions; nothing else on the agent changes."""
+    return {"platform_settings": {"overrides": agent_overrides()}}
+
+
 def client_tool_schema(value, field_name="parameters"):
     """Adapt server JSON Schema to ElevenLabs' client-tool schema subset.
 
@@ -177,11 +196,7 @@ def agent_config(settings: Settings, server_url: str, secret_id: str, args) -> d
         "platform_settings": {
             # Signed URLs only; the agent ID alone cannot start a conversation.
             "auth": {"enable_auth": True},
-            "overrides": {
-                # The app may choose the voice, and pass the grant; nothing else.
-                "conversation_config_override": {"tts": {"voice_id": True}},
-                "custom_llm_extra_body": True,
-            },
+            "overrides": agent_overrides(),
         },
     }
 
@@ -227,6 +242,12 @@ def check(settings: Settings, agent_id: str, client: httpx.Client) -> int:
             ((platform.get("overrides") or {}).get("conversation_config_override") or {}).get("tts")
             or {}
         ).get("voice_id"),
+        "opening_line_override_allowed": (
+            ((platform.get("overrides") or {}).get("conversation_config_override") or {}).get(
+                "agent"
+            )
+            or {}
+        ).get("first_message"),
         "tts_model": conv.get("tts", {}).get("model_id"),
         "default_voice": conv.get("tts", {}).get("voice_id"),
         "output_format": conv.get("tts", {}).get("agent_output_audio_format"),
@@ -281,6 +302,11 @@ def check(settings: Settings, agent_id: str, client: httpx.Client) -> int:
         )
     if not summary["grant_header_mapped"]:
         problems.append("X-Lafina-Voice-Grant header is not mapped")
+    if settings.VOICE_OPENING_LINE_OVERRIDE and not summary["opening_line_override_allowed"]:
+        problems.append(
+            "VOICE_OPENING_LINE_OVERRIDE is on but the agent refuses a first_message override, "
+            "so every app call would be refused (fix with --allow-opening-line --apply)"
+        )
     if summary["output_format"] != "pcm_16000" or summary["input_format"] != "pcm_16000":
         problems.append("the app streams pcm_16000 in and plays pcm_16000 out")
     if summary["max_duration_seconds"] != settings.VOICE_CONVERSATION_MAX_SECONDS:
@@ -328,6 +354,12 @@ def main() -> int:
         help="Patch only the cascade and turn timeouts of the existing agent "
         "(dry run unless --apply). No secret upload, no other field changes.",
     )
+    parser.add_argument(
+        "--allow-opening-line",
+        action="store_true",
+        help="Patch only the existing agent's override permissions so the app may set the "
+        "opening line (dry run unless --apply). Then set VOICE_OPENING_LINE_OVERRIDE=true.",
+    )
     args = parser.parse_args()
 
     settings = Settings()
@@ -352,6 +384,21 @@ def main() -> int:
             if response.status_code != 200:
                 _fail(response, "Patching the agent timeouts")
             print(f"Patched timeouts of agent {agent_id}.")
+            return check(settings, agent_id, client)
+
+    if args.allow_opening_line:
+        patch = opening_line_patch()
+        if not args.apply:
+            print(json.dumps(patch, indent=2))
+            print("\nDry run only. Add --apply to patch the agent.", file=sys.stderr)
+            return 0
+        if not agent_id:
+            sys.exit("No agent to patch: set ELEVENLABS_AGENT_ID or pass --agent-id.")
+        with httpx.Client(headers={"xi-api-key": _key(settings)}, timeout=30) as client:
+            response = client.patch(f"{API}/v1/convai/agents/{agent_id}", json=patch)
+            if response.status_code != 200:
+                _fail(response, "Allowing the opening line override")
+            print(f"Agent {agent_id} now accepts the app's opening line.")
             return check(settings, agent_id, client)
 
     if not args.server_url or not args.server_url.startswith("https://"):

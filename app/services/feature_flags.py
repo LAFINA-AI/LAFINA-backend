@@ -33,10 +33,10 @@ async def is_enabled(db: AsyncSession, key: str) -> bool:
     """Whether a flag is on. An unreadable flag is treated as its default."""
     default = DEFAULT_FLAGS.get(key, (False, ""))[0]
     try:
-        flag = await db.get(FeatureFlag, key)
+        async with db.begin_nested():
+            flag = await db.get(FeatureFlag, key)
     except SQLAlchemyError as exc:
         logger.warning(f"Feature flag {key!r} could not be read ({type(exc).__name__}); using default")
-        await db.rollback()
         return default
     return default if flag is None else bool(flag.enabled)
 

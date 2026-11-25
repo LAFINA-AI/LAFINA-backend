@@ -33,8 +33,13 @@ def is_student_pro(account: Account) -> bool:
 
 
 def has_online_ai_access(account: Account) -> bool:
-    """Online AI (chat, flashcards, study notes, meeting notes): Student Pro or admin."""
+    """Legacy Student Pro or admin predicate."""
     return bool(account.is_active) and (is_student_pro(account) or is_admin(account))
+
+
+def has_study_ai_access(account: Account) -> bool:
+    """Active capstone accounts (student, student_pro, admin) for AI study skills."""
+    return bool(account.is_active)
 
 
 def has_chat_access(account: Account) -> bool:

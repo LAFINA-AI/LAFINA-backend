@@ -21,25 +21,30 @@ def strip_fences(text: str) -> str:
     return stripped.strip()
 
 
-def extract_json_span(text: str) -> str | None:
-    """Finds the outermost JSON array or object in a reply with prose around it.
+def iter_json_spans(text: str) -> list[str]:
+    """Yields top-level balanced JSON array/object spans found inside prose.
 
-    Brackets inside string literals are skipped, so a sentence containing "["
-    of its own does not end the span early. Whichever bracket opens first is
-    the outermost value: trying arrays first would pull the first list out of
-    the middle of an object reply.
+    Unlike stopping at the very first bracket (which fails on prose like
+    ``Note [1]: {"title": ...}``), this scans forward so valid JSON after
+    bracketed labels is still discovered.
     """
-    openers = sorted(
-        ((text.find(opener), opener, closer) for opener, closer in (("[", "]"), ("{", "}"))),
-        key=lambda entry: (entry[0] == -1, entry[0]),
-    )
-    for start, opener, closer in openers:
-        if start == -1:
-            continue
+    spans: list[str] = []
+    pos = 0
+    length = len(text)
+    while pos < length:
+        next_arr = text.find("[", pos)
+        next_obj = text.find("{", pos)
+        if next_arr == -1 and next_obj == -1:
+            break
+        if next_arr == -1 or (next_obj != -1 and next_obj < next_arr):
+            start, opener, closer = next_obj, "{", "}"
+        else:
+            start, opener, closer = next_arr, "[", "]"
         depth = 0
         in_string = False
         escaped = False
-        for index in range(start, len(text)):
+        matched_end = -1
+        for index in range(start, length):
             char = text[index]
             if in_string:
                 if escaped:
@@ -56,17 +61,49 @@ def extract_json_span(text: str) -> str | None:
             elif char == closer:
                 depth -= 1
                 if depth == 0:
-                    return text[start : index + 1]
-    return None
+                    matched_end = index
+                    break
+        if matched_end != -1:
+            spans.append(text[start : matched_end + 1])
+            pos = matched_end + 1
+        else:
+            pos = start + 1
+    return spans
+
+
+def extract_json_span(text: str) -> str | None:
+    """Finds the best outermost JSON array or object in a reply with prose around it."""
+    import json
+
+    spans = iter_json_spans(text)
+    if not spans:
+        return None
+    # Prefer the first span that parses as a dict or a list containing dicts.
+    fallback_valid: str | None = None
+    for span in spans:
+        try:
+            parsed = json.loads(span)
+        except ValueError:
+            continue
+        if isinstance(parsed, dict):
+            return span
+        if isinstance(parsed, list) and (not parsed or any(isinstance(x, dict) for x in parsed)):
+            return span
+        if fallback_valid is None:
+            fallback_valid = span
+    return fallback_valid or spans[0]
 
 
 def json_candidates(raw: str) -> list[str]:
     """The strings worth trying to parse, best first."""
     stripped = strip_fences(raw)
     candidates = [stripped]
-    span = extract_json_span(stripped)
-    if span and span != stripped:
-        candidates.append(span)
+    best = extract_json_span(stripped)
+    if best and best not in candidates:
+        candidates.append(best)
+    for span in iter_json_spans(stripped):
+        if span not in candidates:
+            candidates.append(span)
     return candidates
 
 
@@ -75,5 +112,5 @@ def clean_text(value: object, limit: int) -> str:
     text = re.sub(r"\s+", " ", str(value)).strip()
     text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
     if len(text) > limit:
-        text = text[:limit].rstrip() + "…"
+        text = text[: max(1, limit - 1)].rstrip() + "…"
     return text

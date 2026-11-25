@@ -1,7 +1,8 @@
 import secrets
 from datetime import datetime, timedelta, timezone
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import func, select, update
 
@@ -14,6 +15,7 @@ from app.security.auth import (
     hash_password, verify_password, needs_password_rehash, create_access_token,
     generate_refresh_token, hash_token, get_current_user_and_session,
     normalize_email, validate_password_strength, dummy_password_hash,
+    client_ip_from_request,
 )
 from app.security import login_throttle
 
@@ -29,14 +31,14 @@ class RegisterRequest(BaseModel):
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str
-    device_info: str | None = None
+    device_info: str | None = Field(default=None, max_length=255)
 
 class RefreshRequest(BaseModel):
-    refresh_token: str
+    refresh_token: str = Field(..., min_length=1, max_length=256)
 
 class RecoverRequest(BaseModel):
     email: EmailStr
-    recovery_code: str
+    recovery_code: str = Field(..., min_length=1, max_length=64)
     new_password: str
 
 class ChangePasswordRequest(BaseModel):
@@ -66,8 +68,27 @@ class UserProfileResponse(BaseModel):
     created_at: str
 
 @router.post("/register", response_model=AuthTokenResponse, status_code=status.HTTP_201_CREATED)
-async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
+async def register(req: RegisterRequest, request: Request, db: AsyncSession = Depends(get_db)):
     validate_password_strength(req.password)
+    now = datetime.now(timezone.utc)
+    client_ip = client_ip_from_request(request)
+    if client_ip:
+        reg_key = login_throttle.ip_key(client_ip)
+        retry_after = await login_throttle.seconds_until_allowed(
+            db,
+            reg_key,
+            now,
+            event_type=login_throttle.REGISTER_IP_EVENT,
+            limit=settings.MAX_REGISTRATIONS_PER_IP_PER_HOUR,
+            window=login_throttle.REGISTER_WINDOW,
+        )
+        if retry_after is not None:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Too many registrations from this network. Please try again later.",
+                headers={"Retry-After": str(retry_after)},
+            )
+
     normalized_email = normalize_email(str(req.email))
     stmt = select(Account).where(func.lower(Account.email) == normalized_email)
     res = await db.execute(stmt)
@@ -77,11 +98,17 @@ async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
     password_hash = hash_password(req.password)
     account = Account(email=normalized_email, password_hash=password_hash, role="student")
     db.add(account)
-    await db.flush()
+    try:
+        await db.flush()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Account with this email already exists.",
+        )
 
     raw_refresh = generate_refresh_token()
     refresh_hash = hash_token(raw_refresh)
-    now = datetime.now(timezone.utc)
     expires_at = now + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
 
     session = AuthSession(
@@ -92,18 +119,37 @@ async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
     db.add(session)
     await db.flush()
 
-    # Generate 4 one-time recovery codes
-    raw_recovery_codes = [secrets.token_hex(4).upper() for _ in range(4)]
+    # Generate 4 one-time 80-bit recovery codes
+    raw_recovery_codes = [secrets.token_hex(10).upper() for _ in range(4)]
     for rec_code in raw_recovery_codes:
         db.add(RecoveryCode(owner_id=account.id, code_hash=hash_token(rec_code)))
 
-    await db.commit()
+    if client_ip:
+        from app.models.ai_usage import SecurityEvent
+        db.add(
+            SecurityEvent(
+                event_type=login_throttle.REGISTER_IP_EVENT,
+                owner_id=account.id,
+                ip_address=client_ip[:64],
+                details=login_throttle.ip_key(client_ip),
+            )
+        )
+
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Account with this email already exists.",
+        )
 
     access_token, _ = create_access_token(str(account.id), str(session.id), account.role)
 
     return AuthTokenResponse(
         access_token=access_token,
         refresh_token=raw_refresh,
+        expires_in=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
         user_id=str(account.id),
         email=account.email,
         role=account.role,
@@ -114,15 +160,16 @@ async def register(req: RegisterRequest, db: AsyncSession = Depends(get_db)):
 
 @router.post("/login", response_model=AuthTokenResponse)
 async def login(req: LoginRequest, request: Request, db: AsyncSession = Depends(get_db)):
-    validate_password_strength(req.password)
+    validate_password_strength(req.password, check_blocklist=False)
     normalized_email = normalize_email(str(req.email))
+    client_ip = client_ip_from_request(request)
 
     # Refused before the password is looked at, so a guesser learns nothing
     # more once the limit is reached, and the answer is the same whether or
     # not the email has an account.
     throttle_key = login_throttle.email_key(normalized_email)
     retry_after = await login_throttle.seconds_until_allowed(
-        db, throttle_key, datetime.now(timezone.utc)
+        db, throttle_key, datetime.now(timezone.utc), ip_address=client_ip
     )
     if retry_after is not None:
         minutes = max(1, -(-retry_after // 60))
@@ -149,7 +196,7 @@ async def login(req: LoginRequest, request: Request, db: AsyncSession = Depends(
             db,
             throttle_key,
             owner_id=account.id if account else None,
-            ip_address=request.client.host if request.client else None,
+            ip_address=client_ip,
         )
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password.")
 
@@ -178,6 +225,7 @@ async def login(req: LoginRequest, request: Request, db: AsyncSession = Depends(
     return AuthTokenResponse(
         access_token=access_token,
         refresh_token=raw_refresh,
+        expires_in=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
         user_id=str(account.id),
         email=account.email,
         role=account.role,
@@ -193,7 +241,21 @@ async def refresh(req: RefreshRequest, db: AsyncSession = Depends(get_db)):
     old_session = res.scalar_one_or_none()
 
     now = datetime.now(timezone.utc)
-    if not old_session or old_session.is_revoked:
+    if not old_session:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired refresh token.")
+
+    if old_session.is_revoked:
+        # Record reuse of a revoked refresh token for security auditing without
+        # breaking already-rotated sessions on flaky mobile retries.
+        from app.models.ai_usage import SecurityEvent
+        db.add(
+            SecurityEvent(
+                event_type="refresh_token_reuse",
+                owner_id=old_session.owner_id,
+                details=f"session:{old_session.id}",
+            )
+        )
+        await db.commit()
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired refresh token.")
 
     old_expires_at = old_session.expires_at
@@ -203,14 +265,23 @@ async def refresh(req: RefreshRequest, db: AsyncSession = Depends(get_db)):
     if old_expires_at < now:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired refresh token.")
 
-    # Revoke old session (token rotation)
-    old_session.is_revoked = True
+    # Atomically claim & revoke old session so concurrent refresh races cannot duplicate sessions.
+    claimed = await db.execute(
+        update(AuthSession)
+        .where(AuthSession.id == old_session.id, AuthSession.is_revoked.is_(False))
+        .values(is_revoked=True)
+        .execution_options(synchronize_session=False)
+    )
+    if claimed.rowcount != 1:
+        await db.rollback()
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired refresh token.")
 
     account_stmt = select(Account).where(Account.id == old_session.owner_id)
     account_res = await db.execute(account_stmt)
     account = account_res.scalar_one_or_none()
 
     if not account or not account.is_active:
+        await db.commit()
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Account inactive.")
 
     # Issue new refresh token & session
@@ -232,6 +303,7 @@ async def refresh(req: RefreshRequest, db: AsyncSession = Depends(get_db)):
     return AuthTokenResponse(
         access_token=access_token,
         refresh_token=new_raw_refresh,
+        expires_in=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
         user_id=str(account.id),
         email=account.email,
         role=account.role,
@@ -250,31 +322,69 @@ async def logout(
     return None
 
 @router.post("/recover", status_code=status.HTTP_200_OK)
-async def recover(req: RecoverRequest, db: AsyncSession = Depends(get_db)):
+async def recover(req: RecoverRequest, request: Request, db: AsyncSession = Depends(get_db)):
     validate_password_strength(req.new_password)
 
     normalized_email = normalize_email(str(req.email))
+    now = datetime.now(timezone.utc)
+    client_ip = client_ip_from_request(request)
+    throttle_key = login_throttle.email_key(normalized_email)
+    retry_after = await login_throttle.seconds_until_allowed(
+        db,
+        throttle_key,
+        now,
+        event_type=login_throttle.RECOVER_FAILED_EVENT,
+        limit=settings.MAX_LOGIN_FAILURES_PER_15MIN,
+    )
+    if retry_after is not None:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many recovery attempts for this email. Please try again later.",
+            headers={"Retry-After": str(retry_after)},
+        )
+
     account_stmt = select(Account).where(func.lower(Account.email) == normalized_email)
     account_res = await db.execute(account_stmt)
     account = account_res.scalar_one_or_none()
 
-    if not account:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Account not found.")
+    cleaned_code = req.recovery_code.strip().upper()
+    rec_hash = hash_token(cleaned_code)
+    rec_code = None
+    if account and account.is_active:
+        rec_stmt = select(RecoveryCode).where(
+            RecoveryCode.owner_id == account.id,
+            RecoveryCode.code_hash == rec_hash,
+            RecoveryCode.is_used.is_(False)
+        )
+        rec_res = await db.execute(rec_stmt)
+        rec_code = rec_res.scalar_one_or_none()
 
-    rec_hash = hash_token(req.recovery_code.upper())
-    rec_stmt = select(RecoveryCode).where(
-        RecoveryCode.owner_id == account.id,
-        RecoveryCode.code_hash == rec_hash,
-        RecoveryCode.is_used.is_(False)
+    if not account or not account.is_active or not rec_code:
+        await login_throttle.record_failure(
+            db,
+            throttle_key,
+            owner_id=account.id if account else None,
+            ip_address=client_ip,
+            event_type=login_throttle.RECOVER_FAILED_EVENT,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid email or recovery code.",
+        )
+
+    # Atomically claim the one-time recovery code to prevent concurrent reuse.
+    claimed = await db.execute(
+        update(RecoveryCode)
+        .where(RecoveryCode.id == rec_code.id, RecoveryCode.is_used.is_(False))
+        .values(is_used=True, used_at=now)
+        .execution_options(synchronize_session=False)
     )
-    rec_res = await db.execute(rec_stmt)
-    rec_code = rec_res.scalar_one_or_none()
-
-    if not rec_code:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or previously used recovery code.")
-
-    rec_code.is_used = True
-    rec_code.used_at = datetime.now(timezone.utc)
+    if claimed.rowcount != 1:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid email or recovery code.",
+        )
 
     account.password_hash = hash_password(req.new_password)
 
@@ -291,6 +401,7 @@ async def recover(req: RecoverRequest, db: AsyncSession = Depends(get_db)):
 @router.post("/password", status_code=status.HTTP_200_OK)
 async def change_password(
     req: ChangePasswordRequest,
+    request: Request,
     auth_data: tuple[Account, AuthSession] = Depends(get_current_user_and_session),
     db: AsyncSession = Depends(get_db),
 ):
@@ -302,10 +413,32 @@ async def change_password(
     session making the change survives so the app stays signed in.
     """
     account, session = auth_data
+    now = datetime.now(timezone.utc)
+    throttle_key = login_throttle.email_key(account.email)
+    retry_after = await login_throttle.seconds_until_allowed(
+        db,
+        throttle_key,
+        now,
+        event_type=login_throttle.PASSWORD_CHANGE_FAILED_EVENT,
+        limit=settings.MAX_LOGIN_FAILURES_PER_15MIN,
+    )
+    if retry_after is not None:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many failed password attempts. Please try again later.",
+            headers={"Retry-After": str(retry_after)},
+        )
 
     # 400 rather than 401: the request itself is authenticated, and a client
     # that reads 401 as "session expired" would sign the user out over a typo.
     if not verify_password(req.current_password, account.password_hash):
+        await login_throttle.record_failure(
+            db,
+            throttle_key,
+            owner_id=account.id,
+            ip_address=client_ip_from_request(request),
+            event_type=login_throttle.PASSWORD_CHANGE_FAILED_EVENT,
+        )
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Current password is incorrect.",

@@ -25,8 +25,10 @@ from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.ai import (
-    _enforce_ai_quota,
+    finalize_ai_usage,
     get_deepseek_client,
+    release_ai_usage,
+    reserve_ai_usage,
 )
 from app.clients.deepseek import (
     DeepSeekAuthenticationError,
@@ -44,10 +46,9 @@ from app.clients.deepseek import (
 from app.config import get_settings
 from app.database import get_db
 from app.models.account import Account
-from app.models.ai_usage import AIUsage
 from app.models.session import AuthSession
 from app.security.auth import get_current_user_and_session
-from app.services.capabilities import has_online_ai_access
+from app.services.capabilities import has_study_ai_access
 from app.services.meeting_notes import (
     CONSOLIDATE_SYSTEM_PROMPT,
     MAX_FINAL_CHARS,
@@ -116,7 +117,7 @@ class GenerateRequest(BaseModel):
     requestId: str = Field(default_factory=lambda: str(uuid.uuid4()))
     content: str = Field(..., min_length=1)
     source: Literal["transcript", "sections"] = "transcript"
-    titleHint: str = Field(default="", max_length=160)
+    titleHint: str = Field(default="", max_length=200)
     recordedAt: str = Field(default="", max_length=64)
 
 
@@ -163,7 +164,7 @@ def _http_error(err: DeepSeekError) -> HTTPException:
         )
     if isinstance(err, DeepSeekInvalidRequestError) and looks_like_context_overflow(err.message):
         return HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
             detail="This part of the meeting was too long for DeepSeek to read in one go.",
         )
     if isinstance(err, DeepSeekMalformedResponseError):
@@ -183,9 +184,15 @@ async def _complete_with_retry(
     user_prompt: str,
     account: Account,
     request_id: str,
-) -> tuple[MeetingNotes, dict]:
-    """Asks for notes, retrying once on a momentary failure or an unreadable reply."""
+) -> tuple[MeetingNotes | None, dict, bool, HTTPException | None]:
+    """Asks for notes, retrying once on a momentary failure or an unreadable reply.
+
+    Returns ``(notes, total_usage, model_answered, http_error)`` so callers can
+    always record spent tokens even when parsing fails.
+    """
     last_error: Exception | None = None
+    totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    model_answered = False
     for attempt in range(2):
         try:
             reply, usage = await deepseek.json_completion(
@@ -198,48 +205,44 @@ async def _complete_with_retry(
                 model=settings.DEEPSEEK_FLASHCARD_MODEL,
                 max_tokens=4096,
             )
-            return parse_meeting_notes_json(reply), usage
+            model_answered = True
+            for key in totals:
+                totals[key] += int(usage.get(key, 0) or 0)
+            return parse_meeting_notes_json(reply), totals, model_answered, None
         except TRANSIENT_ERRORS as err:
             last_error = err
         except MeetingNotesParseError as err:
             # A malformed reply is often a one-off; a second is reported.
             last_error = err
         except DeepSeekError as err:
-            raise _http_error(err)
+            return None, totals, model_answered, _http_error(err)
         if attempt == 0:
             logger.warning("Meeting notes attempt failed, retrying once: %s", last_error)
             await asyncio.sleep(RETRY_DELAY_SECONDS)
 
     if isinstance(last_error, MeetingNotesParseError):
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="DeepSeek returned notes that could not be read. Try generating them again.",
+        return (
+            None,
+            totals,
+            model_answered,
+            HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="DeepSeek returned notes that could not be read. Try generating them again.",
+            ),
         )
     assert isinstance(last_error, DeepSeekError)
-    raise _http_error(last_error)
+    return None, totals, model_answered, _http_error(last_error)
 
 
 def _require_entitlement(account: Account) -> None:
-    if not has_online_ai_access(account):
+    if not has_study_ai_access(account):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=(
-                "AI meeting notes require a student_pro subscription. "
+                "AI meeting notes require an active account. "
                 "Your recording and transcript stay available on this computer."
             ),
         )
-
-
-def _record_usage(db: AsyncSession, account: Account, request_type: str, usage: dict, now: datetime) -> None:
-    db.add(
-        AIUsage(
-            owner_id=account.id,
-            request_type=request_type,
-            prompt_tokens=usage.get("prompt_tokens", 0),
-            completion_tokens=usage.get("completion_tokens", 0),
-            created_at=now,
-        )
-    )
 
 
 @router.post("/section", response_model=NotesResponse)
@@ -253,16 +256,21 @@ async def summarise_section(
     account, _ = auth_data
     _require_entitlement(account)
 
+    if not req.content.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Meeting content cannot be empty or whitespace only.",
+        )
     if len(req.content) > MAX_SECTION_CHARS:
         raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
             detail=f"A section can be at most {MAX_SECTION_CHARS:,} characters. Split it further.",
         )
     if req.index >= req.count:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Section index is out of range.")
 
     now = datetime.now(timezone.utc)
-    await _enforce_ai_quota(
+    usage_row = await reserve_ai_usage(
         db,
         account.id,
         now,
@@ -273,15 +281,21 @@ async def summarise_section(
         day_message="Today's limit for summarising meetings has been reached. Try again tomorrow.",
     )
 
-    notes, usage = await _complete_with_retry(
+    notes, usage, model_answered, http_err = await _complete_with_retry(
         deepseek,
         SECTION_SYSTEM_PROMPT,
         build_section_prompt(req.content, req.index, req.count, req.material),
         account,
         req.requestId,
     )
-    _record_usage(db, account, "meeting_notes_section", usage, now)
-    await db.commit()
+    if model_answered:
+        await finalize_ai_usage(
+            db, account.id, usage_row.id, usage["prompt_tokens"], usage["completion_tokens"]
+        )
+    else:
+        await release_ai_usage(db, account.id, usage_row.id)
+    if http_err is not None or notes is None:
+        raise http_err or HTTPException(status_code=502, detail="Could not summarise section.")
 
     return NotesResponse(
         requestId=req.requestId,
@@ -303,9 +317,14 @@ async def generate_notes(
     account, _ = auth_data
     _require_entitlement(account)
 
+    if not req.content.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Meeting content cannot be empty or whitespace only.",
+        )
     if len(req.content) > MAX_FINAL_CHARS:
         raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
             detail=(
                 f"The meeting material is longer than {MAX_FINAL_CHARS:,} characters. "
                 "Summarise it in sections first."
@@ -313,7 +332,7 @@ async def generate_notes(
         )
 
     now = datetime.now(timezone.utc)
-    await _enforce_ai_quota(
+    usage_row = await reserve_ai_usage(
         db,
         account.id,
         now,
@@ -325,24 +344,30 @@ async def generate_notes(
     )
 
     system_prompt = MEETING_NOTES_SYSTEM_PROMPT if req.source == "transcript" else CONSOLIDATE_SYSTEM_PROMPT
-    notes, usage = await _complete_with_retry(
+    notes, usage, model_answered, http_err = await _complete_with_retry(
         deepseek,
         system_prompt,
         build_final_prompt(req.content, req.source, req.titleHint, req.recordedAt),
         account,
         req.requestId,
     )
+    if model_answered:
+        await finalize_ai_usage(
+            db, account.id, usage_row.id, usage["prompt_tokens"], usage["completion_tokens"]
+        )
+    else:
+        await release_ai_usage(db, account.id, usage_row.id)
+    if http_err is not None or notes is None:
+        raise http_err or HTTPException(status_code=502, detail="Could not generate meeting notes.")
+
     if notes.is_empty:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=(
                 "DeepSeek found nothing to take notes on. The recording may be silent, or the "
                 "transcript may be too garbled — check the Transcript tab."
             ),
         )
-
-    _record_usage(db, account, "meeting_notes", usage, now)
-    await db.commit()
 
     return NotesResponse(
         requestId=req.requestId,

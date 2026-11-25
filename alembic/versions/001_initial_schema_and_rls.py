@@ -193,6 +193,7 @@ def downgrade() -> None:
     """Remove the complete baseline schema in dependency-safe order."""
     for table in SYNC_TABLES:
         op.execute(f"DROP POLICY IF EXISTS {table}_owner_policy ON {table};")
+        op.execute(f"ALTER TABLE {table} NO FORCE ROW LEVEL SECURITY;")
         op.execute(f"ALTER TABLE {table} DISABLE ROW LEVEL SECURITY;")
 
     op.drop_table("security_events")

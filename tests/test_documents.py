@@ -390,11 +390,10 @@ async def test_student_pro_by_plan_alone_is_enough(async_client: AsyncClient, fa
     ("role", "plan", "system_role"),
     [
         ("student", "student", "user"),
-        ("business", "business", "user"),
         ("admin", "student", "admin"),
     ],
 )
-async def test_files_are_exclusive_to_student_pro(
+async def test_files_are_available_to_active_students_and_admins(
     async_client: AsyncClient, fake_deepseek, role, plan, system_role
 ):
     fake = fake_deepseek(FakeDeepSeek())
@@ -402,9 +401,8 @@ async def test_files_are_exclusive_to_student_pro(
         async_client, f"doc_{role}@ustp.edu.ph", role=role, plan=plan, system_role=system_role
     )
     res = await async_client.post("/v1/ai/documents", headers=headers, json=_body())
-    assert res.status_code == 403
-    assert "student_pro" in res.json()["detail"]
-    assert fake.calls == []
+    assert res.status_code == 200, res.text
+    assert len(fake.calls) == 1
 
 
 @pytest.mark.asyncio

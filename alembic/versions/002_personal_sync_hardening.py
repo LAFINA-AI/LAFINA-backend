@@ -86,6 +86,7 @@ def downgrade() -> None:
     """Restore the legacy global mutation key while retaining auto-increment IDs."""
     for table in ("change_feed", "idempotent_mutations"):
         op.execute(f"DROP POLICY IF EXISTS {table}_owner_policy ON {table}")
+        op.execute(f"ALTER TABLE {table} NO FORCE ROW LEVEL SECURITY")
         op.execute(f"ALTER TABLE {table} DISABLE ROW LEVEL SECURITY")
 
     op.drop_constraint(

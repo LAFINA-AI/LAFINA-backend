@@ -100,5 +100,6 @@ def upgrade() -> None:
 def downgrade() -> None:
     """Remove the durable snapshot high-water marks."""
     op.execute("DROP POLICY IF EXISTS sync_heads_owner_policy ON sync_heads")
+    op.execute("ALTER TABLE sync_heads NO FORCE ROW LEVEL SECURITY")
     op.execute("ALTER TABLE sync_heads DISABLE ROW LEVEL SECURITY")
     op.drop_table("sync_heads")

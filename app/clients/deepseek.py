@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import time
 from typing import AsyncIterator, Optional
 
@@ -118,22 +119,25 @@ class DeepSeekTransportError(DeepSeekError):
         super().__init__(message, status_code=503)
 
 
-def upstream_error(status_code: int, detail: str) -> DeepSeekError:
-    """Maps a non-200 DeepSeek status to the client-safe error we raise."""
+def upstream_error(status_code: int, detail: str = "") -> DeepSeekError:
+    """Maps a non-200 DeepSeek status to a sanitized client-safe error.
+
+    Raw upstream text is logged server-side by the caller and never reflected
+    verbatim to end users (prevents leaking gateway HTML or provider account details).
+    """
+    _ = detail
     if status_code == 401:
-        return DeepSeekAuthenticationError(f"DeepSeek provider authentication failed: {detail}")
+        return DeepSeekAuthenticationError()
     if status_code == 402:
-        return DeepSeekBillingError(f"DeepSeek provider billing is unavailable: {detail}")
+        return DeepSeekBillingError()
     if status_code == 429:
-        return DeepSeekRateLimitError(
-            f"DeepSeek rate limit exceeded. Please try again later: {detail}"
-        )
+        return DeepSeekRateLimitError()
     if status_code in (400, 422):
-        return DeepSeekInvalidRequestError(f"Invalid request sent to DeepSeek provider: {detail}")
+        return DeepSeekInvalidRequestError()
     if status_code in (500, 503):
-        return DeepSeekProviderServerError(f"DeepSeek provider temporary outage: {detail}")
+        return DeepSeekProviderServerError()
     return DeepSeekError(
-        message=f"DeepSeek provider returned error status {status_code}: {detail}",
+        message=f"DeepSeek provider returned error status {status_code}.",
         status_code=502,
     )
 
@@ -168,54 +172,54 @@ class SpeechReasoningFilter:
     """Drop common hidden-reasoning tags even when tags cross stream chunks."""
 
     PAIRS = (("<think>", "</think>"), ("<analysis>", "</analysis>"))
+    _OPEN_OR_STRAY_RE = re.compile(r"</?(?:think|analysis)>", re.IGNORECASE)
+    _CLOSE_RES = {
+        "</think>": re.compile(r"</think>", re.IGNORECASE),
+        "</analysis>": re.compile(r"</analysis>", re.IGNORECASE),
+    }
+    _ALL_TAGS = ("<think>", "</think>", "<analysis>", "</analysis>")
 
     def __init__(self):
         self.buffer = ""
-        self.end_tag = None
+        self.end_tag: str | None = None
 
     def feed(self, text: str, *, final: bool = False) -> str:
         self.buffer += text
         output = []
         while self.buffer:
-            lower = self.buffer.lower()
             if self.end_tag:
-                index = lower.find(self.end_tag)
-                if index < 0:
+                match = self._CLOSE_RES[self.end_tag].search(self.buffer)
+                if not match:
                     self.buffer = "" if final else self.buffer[-(len(self.end_tag) - 1) :]
                     break
-                self.buffer = self.buffer[index + len(self.end_tag) :]
+                self.buffer = self.buffer[match.end() :]
                 self.end_tag = None
                 continue
-            matches = [
-                (lower.find(start), start, end)
-                for start, end in self.PAIRS
-                if lower.find(start) >= 0
-            ]
-            if matches:
-                index, start, end = min(matches)
-                output.append(self.buffer[:index])
-                self.buffer = self.buffer[index + len(start) :]
-                self.end_tag = end
+            match = self._OPEN_OR_STRAY_RE.search(self.buffer)
+            if match:
+                output.append(self.buffer[: match.start()])
+                tag = match.group(0).lower()
+                self.buffer = self.buffer[match.end() :]
+                if not tag.startswith("</"):
+                    self.end_tag = f"</{tag[1:]}"
                 continue
             if final:
-                # Never speak an unfinished opening tag.
+                # Never speak an unfinished opening/closing tag.
                 cut = self.buffer.rfind("<")
                 if cut >= 0 and any(
-                    start.startswith(self.buffer[cut:].lower()) for start, _ in self.PAIRS
+                    tag.startswith(self.buffer[cut:].lower()) for tag in self._ALL_TAGS
                 ):
                     self.buffer = self.buffer[:cut]
                 output.append(self.buffer)
                 self.buffer = ""
             else:
-                keep = max(
-                    (
-                        size
-                        for start, _ in self.PAIRS
-                        for size in range(1, len(start))
-                        if lower.endswith(start[:size])
-                    ),
-                    default=0,
-                )
+                tail = self.buffer[-12:]
+                lower_tail = tail.lower()
+                keep = 0
+                for tag in self._ALL_TAGS:
+                    for size in range(1, min(len(tag), len(lower_tail)) + 1):
+                        if lower_tail.endswith(tag[:size]) and size > keep:
+                            keep = size
                 if keep:
                     output.append(self.buffer[:-keep])
                     self.buffer = self.buffer[-keep:]
@@ -312,7 +316,8 @@ class DeepSeekClient:
         url = f"{self.settings.DEEPSEEK_BASE_URL.rstrip('/')}/chat/completions"
         start_time = time.monotonic()
         calls: dict[int, dict] = {}
-        finish_reason = "stop"
+        finish_reason: str | None = None
+        saw_done = False
         usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         produced = False
         speech_filter = SpeechReasoningFilter() if sanitize_for_speech else None
@@ -338,6 +343,7 @@ class DeepSeekClient:
                         continue
                     data = line[5:].strip()
                     if data == "[DONE]":
+                        saw_done = True
                         break
                     try:
                         chunk = json.loads(data)
@@ -352,8 +358,8 @@ class DeepSeekClient:
                             if isinstance(value, int):
                                 usage[key] = value
                     for choice in chunk.get("choices") or []:
-                        if choice.get("finish_reason") == "tool_calls":
-                            finish_reason = "tool_calls"
+                        if choice.get("finish_reason"):
+                            finish_reason = str(choice.get("finish_reason"))
                         delta = choice.get("delta") or {}
                         if delta.get("tool_calls") and not stream_started:
                             stream_started = True
@@ -412,8 +418,9 @@ class DeepSeekClient:
             normalized = []
             ids = set()
             for idx, item in sorted(calls.items()):
+                raw_args = item["arguments"].strip() or "{}"
                 try:
-                    arguments = json.loads(item["arguments"])
+                    arguments = json.loads(raw_args)
                 except ValueError:
                     raise DeepSeekMalformedResponseError("Malformed tool arguments.") from None
                 if (
@@ -429,7 +436,7 @@ class DeepSeekClient:
                         "index": idx,
                         "id": item["id"],
                         "type": "function",
-                        "function": {"name": item["name"], "arguments": item["arguments"]},
+                        "function": {"name": item["name"], "arguments": raw_args},
                     }
                 )
             if finish_reason != "tool_calls":
@@ -439,6 +446,10 @@ class DeepSeekClient:
         if not produced:
             raise DeepSeekMalformedResponseError(
                 "Received null or empty content from DeepSeek provider."
+            )
+        if not saw_done and finish_reason is None:
+            raise DeepSeekMalformedResponseError(
+                "DeepSeek stream ended unexpectedly before completion."
             )
         duration_ms = int((time.monotonic() - start_time) * 1000)
         logger.info(

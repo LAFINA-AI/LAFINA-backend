@@ -1,9 +1,10 @@
 import uuid
+from datetime import datetime, timezone
 from sqladmin import Admin, ModelView
 from sqladmin.authentication import AuthenticationBackend
 from starlette.requests import Request
 from starlette.responses import RedirectResponse
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.config import get_settings
 from app.database import AsyncSessionLocal
@@ -13,10 +14,12 @@ from app.models import (
     RemindersSync, NotesSync, CustomCategoriesSync,
     PomodoroSettingsSync, PomodoroSessionsSync, FlashcardDecksSync,
     StudySummariesSync, RecordedMeetingsSync,
+    ChatSessionsSync, ChatMessagesSync, VoiceSession,
     IdempotentMutation, ChangeFeed, SyncHead, AIUsage, SecurityEvent,
     FeatureFlag,
 )
-from app.security.auth import verify_password
+from app.security import login_throttle
+from app.security.auth import client_ip_from_request, dummy_password_hash, verify_password
 
 settings = get_settings()
 
@@ -42,15 +45,32 @@ class AdminAuth(AuthenticationBackend):
             return False
 
         async with get_admin_session_maker()() as db:
-            stmt = select(Account).where(Account.email == email)
+            now = datetime.now(timezone.utc)
+            throttle_key = login_throttle.email_key(email)
+            client_ip = client_ip_from_request(request)
+            if await login_throttle.seconds_until_allowed(db, throttle_key, now, ip_address=client_ip) is not None:
+                return False
+
+            stmt = select(Account).where(func.lower(Account.email) == email)
             res = await db.execute(stmt)
             account = res.scalar_one_or_none()
 
+            password_ok = verify_password(
+                password, account.password_hash if account else dummy_password_hash()
+            )
             # Require active account with admin role and valid password
-            if not account or not account.is_active or (account.role != "admin" and account.system_role != "admin"):
-                return False
-
-            if not verify_password(password, account.password_hash):
+            if (
+                not account
+                or not account.is_active
+                or (account.role != "admin" and account.system_role != "admin")
+                or not password_ok
+            ):
+                await login_throttle.record_failure(
+                    db,
+                    throttle_key,
+                    owner_id=account.id if account else None,
+                    ip_address=client_ip,
+                )
                 return False
 
             request.session.update({
@@ -86,16 +106,25 @@ class AdminAuth(AuthenticationBackend):
         return True
 
 class AccountAdmin(ModelView, model=Account):
-    column_list = ["id", "email", "role", "subscription_plan", "is_active", "created_at"]
+    column_list = ["id", "email", "role", "system_role", "subscription_plan", "is_active", "created_at"]
     column_searchable_list = ["email", "role", "subscription_plan"]
+    column_details_exclude_list = ["password_hash"]
+    form_excluded_columns = ["password_hash"]
     icon = "fa-solid fa-users"
 
 class AuthSessionAdmin(ModelView, model=AuthSession):
     column_list = ["id", "owner_id", "device_info", "is_revoked", "expires_at"]
+    column_details_exclude_list = ["refresh_token_hash"]
+    form_excluded_columns = ["refresh_token_hash"]
+    can_create = False
     icon = "fa-solid fa-key"
 
 class RecoveryCodeAdmin(ModelView, model=RecoveryCode):
     column_list = ["id", "owner_id", "is_used", "used_at"]
+    column_details_exclude_list = ["code_hash"]
+    form_excluded_columns = ["code_hash"]
+    can_create = False
+    can_edit = False
     icon = "fa-solid fa-shield-halved"
 
 class ProfileSyncAdmin(ModelView, model=ProfileSync):
@@ -149,7 +178,29 @@ class StudySummariesSyncAdmin(ModelView, model=StudySummariesSync):
 
 class RecordedMeetingsSyncAdmin(ModelView, model=RecordedMeetingsSync):
     column_list = ["owner_id", "client_id", "version", "change_id", "updated_at"]
+    can_create = False
+    can_edit = False
+    can_delete = False
     icon = "fa-solid fa-microphone-lines"
+
+class ChatSessionsSyncAdmin(ModelView, model=ChatSessionsSync):
+    column_list = ["owner_id", "client_id", "version", "change_id", "updated_at", "deleted_at"]
+    can_create = False
+    can_edit = False
+    can_delete = False
+    icon = "fa-solid fa-comments"
+
+class ChatMessagesSyncAdmin(ModelView, model=ChatMessagesSync):
+    column_list = ["owner_id", "client_id", "version", "change_id", "updated_at", "deleted_at"]
+    can_create = False
+    can_edit = False
+    can_delete = False
+    icon = "fa-solid fa-message"
+
+class VoiceSessionAdmin(ModelView, model=VoiceSession):
+    column_list = ["id", "owner_id", "status", "turns", "ended_reason", "created_at", "expires_at"]
+    can_create = False
+    icon = "fa-solid fa-phone-volume"
 
 class IdempotentMutationAdmin(ModelView, model=IdempotentMutation):
     column_list = ["mutation_id", "owner_id", "status", "created_at"]
@@ -183,7 +234,7 @@ class SecurityEventAdmin(ModelView, model=SecurityEvent):
     column_list = ["id", "owner_id", "event_type", "ip_address", "created_at"]
     icon = "fa-solid fa-shield-virus"
 
-authentication_backend = AdminAuth(secret_key=settings.JWT_PRIVATE_KEY[:32])
+authentication_backend = AdminAuth(secret_key=settings.get_admin_session_secret())
 
 def setup_admin(app, engine):
     admin = Admin(
@@ -208,6 +259,9 @@ def setup_admin(app, engine):
     admin.add_view(FlashcardDecksSyncAdmin)
     admin.add_view(StudySummariesSyncAdmin)
     admin.add_view(RecordedMeetingsSyncAdmin)
+    admin.add_view(ChatSessionsSyncAdmin)
+    admin.add_view(ChatMessagesSyncAdmin)
+    admin.add_view(VoiceSessionAdmin)
     admin.add_view(IdempotentMutationAdmin)
     admin.add_view(ChangeFeedAdmin)
     admin.add_view(SyncHeadAdmin)

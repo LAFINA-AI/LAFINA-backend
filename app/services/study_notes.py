@@ -182,7 +182,11 @@ def parse_study_notes_json(raw: str) -> StudySummary:
 
 
 def _key(text: str) -> str:
-    return re.sub(r"[^a-z0-9 ]", "", text.lower()).strip()
+    folded = re.sub(r"[^\w\s]", "", text.casefold())
+    collapsed = re.sub(r"\s+", " ", folded).strip()
+    if collapsed:
+        return collapsed
+    return re.sub(r"\s+", " ", text.casefold()).strip()
 
 
 def merge_summaries(parts: list[StudySummary]) -> StudySummary:

@@ -128,7 +128,11 @@ def parse_flashcard_json(raw: str) -> list[Flashcard]:
 
 
 def _dedupe_key(question: str) -> str:
-    return re.sub(r"[^a-z0-9 ]", "", question.lower()).strip()
+    folded = re.sub(r"[^\w\s]", "", question.casefold())
+    collapsed = re.sub(r"\s+", " ", folded).strip()
+    if collapsed:
+        return collapsed
+    return re.sub(r"\s+", " ", question.casefold()).strip()
 
 
 def merge_cards(batches: list[list[Flashcard]], limit: int = 200) -> list[Flashcard]:
@@ -158,16 +162,22 @@ ANKI_HEADER_LINES = ("#separator:tab", "#html:true", "#columns:Front\tBack")
 
 
 def escape_anki_field(value: str) -> str:
-    """Makes one field safe for a tab-delimited import.
+    """Makes one field safe for a tab-delimited HTML import.
 
-    A tab would start a new column and a newline a new note, so both have to
-    go: the newline becomes a line break Anki renders, which is why the export
-    declares ``#html:true``.
+    Escapes HTML entities before converting newlines to ``<br>`` so untrusted
+    document text cannot inject HTML/scripts into Anki's WebView and STEM
+    expressions like ``a < b && b > c`` render verbatim.
     """
+    import html
+
     text = str(value).replace("\r\n", "\n").replace("\r", "\n")
     text = text.replace("\t", " ")
+    text = html.escape(text, quote=True)
     text = text.replace("\n", "<br>")
-    return re.sub(r"[ ]{2,}", " ", text).strip()
+    text = re.sub(r"[ ]{2,}", " ", text).strip()
+    if text.startswith("#"):
+        text = "&#35;" + text[1:]
+    return text
 
 
 def to_anki_tsv(cards: list[Flashcard], include_header: bool = True) -> str:

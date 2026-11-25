@@ -1,4 +1,5 @@
 import functools
+import hashlib
 import os
 from typing import Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -9,22 +10,21 @@ from pydantic import SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-# Generate default RSA key pair for development/testing if not provided via env
-def _generate_dev_rsa_pair():
+# Generate default RSA key pair lazily for development/testing if not provided via env
+@functools.lru_cache(maxsize=1)
+def _get_dev_rsa_pair() -> tuple[str, str]:
     private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     private_pem = private_key.private_bytes(
         encoding=serialization.Encoding.PEM,
         format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption()
+        encryption_algorithm=serialization.NoEncryption(),
     ).decode("utf-8")
     public_pem = private_key.public_key().public_bytes(
         encoding=serialization.Encoding.PEM,
-        format=serialization.PublicFormat.SubjectPublicKeyInfo
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
     ).decode("utf-8")
     return private_pem, public_pem
 
-
-_dev_priv_pem, _dev_pub_pem = _generate_dev_rsa_pair()
 
 INVALID_PLACEHOLDER_KEYS = {
     "",
@@ -33,6 +33,8 @@ INVALID_PLACEHOLDER_KEYS = {
     "sk-your-deepseek-api-key",
     "placeholder",
     "your_deepseek_api_key",
+    "your_deepseek_api_key_here",
+    "your_gemini_api_key_here",
     "change-me",
 }
 
@@ -133,13 +135,14 @@ class Settings(BaseSettings):
     VERCEL: Optional[str] = None
     VERCEL_URL: Optional[str] = None
 
-    # Optional Admin Account Seeding from Environment Variables
+    # Optional Admin Account Seeding & Session Secret from Environment Variables
     ADMIN_EMAIL: Optional[str] = None
     ADMIN_PASSWORD: Optional[str] = None
+    ADMIN_SESSION_SECRET: SecretStr | None = None
 
-    # JWT RS256 Configuration
-    JWT_PRIVATE_KEY: str = _dev_priv_pem
-    JWT_PUBLIC_KEY: str = _dev_pub_pem
+    # JWT RS256 Configuration (lazy dev keypair generated only in non-production)
+    JWT_PRIVATE_KEY: str = ""
+    JWT_PUBLIC_KEY: str = ""
     JWT_ISSUER: str = "lafina-auth"
     JWT_AUDIENCE: str = "lafina-app"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
@@ -170,7 +173,7 @@ class Settings(BaseSettings):
     # Flashcards need a model that follows a strict output shape over a long
     # reply, which is a different job from the conversational assistant.
     DEEPSEEK_FLASHCARD_MODEL: str = "deepseek-chat"
-    DEEPSEEK_TIMEOUT_SECONDS: float = 120.0
+    DEEPSEEK_TIMEOUT_SECONDS: float = 50.0
 
     # Gemini TTS Configuration
     # Server-held ElevenLabs credentials; Gemini speech is retired by the TTS routes.
@@ -354,6 +357,21 @@ class Settings(BaseSettings):
         """Pinecone both embeds and stores the handbook, so its key and index are all it needs."""
         return self.get_pinecone_invalid_reason() is None
 
+    def get_admin_session_secret(self) -> str:
+        """High-entropy signing secret for SQLAdmin session cookies.
+
+        Uses ADMIN_SESSION_SECRET when set (minimum 32 chars); otherwise derives a
+        domain-separated SHA-256 digest of the full JWT private key so the PEM
+        header prefix is never used directly as a signing secret.
+        """
+        if self.ADMIN_SESSION_SECRET is not None:
+            raw = self.ADMIN_SESSION_SECRET.get_secret_value().strip()
+            if len(raw) >= 32:
+                return raw
+        return hashlib.sha256(
+            b"lafina-admin-session-v1:" + self.JWT_PRIVATE_KEY.encode("utf-8")
+        ).hexdigest()
+
     @model_validator(mode="after")
     def validate_deepseek_config(self) -> "Settings":
         # Compatibility for the retired alias used by existing deployments.
@@ -364,6 +382,29 @@ class Settings(BaseSettings):
             raise ValueError(
                 f"DEEPSEEK_API_KEY secret environment variable must be configured with a valid key in production ({reason})."
             )
+
+        priv = (self.JWT_PRIVATE_KEY or "").strip().replace("\\n", "\n")
+        pub = (self.JWT_PUBLIC_KEY or "").strip().replace("\\n", "\n")
+        if not priv or not pub:
+            if self.ENVIRONMENT == "production":
+                raise ValueError(
+                    "JWT_PRIVATE_KEY and JWT_PUBLIC_KEY environment variables must be explicitly configured in production."
+                )
+            dev_priv, dev_pub = _get_dev_rsa_pair()
+            priv = priv or dev_priv
+            pub = pub or dev_pub
+        else:
+            if self.ENVIRONMENT == "production":
+                try:
+                    serialization.load_pem_private_key(priv.encode("utf-8"), password=None)
+                    serialization.load_pem_public_key(pub.encode("utf-8"))
+                except Exception as exc:
+                    raise ValueError(
+                        f"JWT_PRIVATE_KEY / JWT_PUBLIC_KEY must be valid PEM keys in production ({type(exc).__name__})."
+                    ) from exc
+
+        self.JWT_PRIVATE_KEY = priv
+        self.JWT_PUBLIC_KEY = pub
         return self
 
     model_config = SettingsConfigDict(

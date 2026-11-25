@@ -19,7 +19,6 @@ class IdempotentMutation(Base):
         ForeignKey("accounts.id", ondelete="CASCADE"),
         primary_key=True,
         nullable=False,
-        index=True,
     )
     mutation_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False)

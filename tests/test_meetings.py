@@ -38,28 +38,26 @@ async def test_meeting_summary_generation_entitled(async_client: AsyncClient):
     token = login_res.json()["access_token"]
     headers = {"Authorization": f"Bearer {token}"}
 
-    fake_deepseek_reply = {
-        "reply": (
-            "{\n"
-            '  "key_points": ["Discussed IoT firmware v2.1 timeline", "Calibration team ready"],\n'
-            '  "decisions": ["Ship firmware by Friday"],\n'
-            '  "open_questions": ["Is hardware buffer size sufficient?"],\n'
-            '  "action_items": [\n'
-            "    {\n"
-            '      "task": "Calibrate oscilloscopes",\n'
-            '      "assignee": "Alice",\n'
-            '      "due": "2026-08-28T17:00:00Z",\n'
-            '      "context": "Needs zero jitter"\n'
-            "    }\n"
-            "  ]\n"
-            "}"
-        ),
-        "model": "deepseek-chat",
-    }
+    fake_reply_json = (
+        "{\n"
+        '  "key_points": ["Discussed IoT firmware v2.1 timeline", "Calibration team ready"],\n'
+        '  "decisions": ["Ship firmware by Friday"],\n'
+        '  "open_questions": ["Is hardware buffer size sufficient?"],\n'
+        '  "action_items": [\n'
+        "    {\n"
+        '      "task": "Calibrate oscilloscopes",\n'
+        '      "assignee": "Alice",\n'
+        '      "due": "2026-08-28T17:00:00Z",\n'
+        '      "context": "Needs zero jitter"\n'
+        "    }\n"
+        "  ]\n"
+        "}"
+    )
 
     with patch(
         "app.clients.deepseek.DeepSeekClient.chat_completion",
-        return_value=fake_deepseek_reply,
+        autospec=True,
+        return_value=(fake_reply_json, {"prompt_tokens": 50, "completion_tokens": 30, "total_tokens": 80}),
     ):
         res = await async_client.post(
             "/v1/meetings/summary",
@@ -80,8 +78,11 @@ async def test_meeting_summary_generation_entitled(async_client: AsyncClient):
 
 
 @pytest.mark.asyncio
-async def test_meeting_summary_rejects_free_student_account(async_client: AsyncClient):
-    """Free student accounts must receive 403 when calling `/v1/meetings/summary`."""
+async def test_meeting_summary_allows_active_student_account(async_client: AsyncClient):
+    """Active student accounts can call `/v1/meetings/summary`; unauthenticated callers get 401."""
+    anon = await async_client.post("/v1/meetings/summary", json={"transcript": "Lecture notes."})
+    assert anon.status_code == 401
+
     async with TestingSessionLocal() as db:
         student_user = Account(
             id=uuid.uuid4(),
@@ -105,10 +106,15 @@ async def test_meeting_summary_rejects_free_student_account(async_client: AsyncC
     assert login_res.status_code == 200
     headers = {"Authorization": f"Bearer {login_res.json()['access_token']}"}
 
-    res = await async_client.post(
-        "/v1/meetings/summary",
-        json={"transcript": "Lecture check-in notes."},
-        headers=headers,
-    )
-    assert res.status_code == 403
-    assert "Student Pro" in res.json()["detail"]
+    with patch(
+        "app.clients.deepseek.DeepSeekClient.chat_completion",
+        autospec=True,
+        return_value=('{"key_points": ["Reviewed lecture"], "decisions": [], "open_questions": [], "action_items": []}', {"prompt_tokens": 10, "completion_tokens": 5}),
+    ):
+        res = await async_client.post(
+            "/v1/meetings/summary",
+            json={"transcript": "Lecture check-in notes."},
+            headers=headers,
+        )
+    assert res.status_code == 200
+    assert res.json()["summary"]["key_points"] == ["Reviewed lecture"]

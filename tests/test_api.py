@@ -112,7 +112,8 @@ async def test_recovery_password_policy(async_client: AsyncClient):
         "recovery_code": "MISSING",
         "new_password": "abc123"
     })
-    assert six_res.status_code == 404
+    assert six_res.status_code == 400
+    assert six_res.json()["detail"] == "Invalid email or recovery code."
 
 
 @pytest.mark.asyncio
@@ -180,7 +181,6 @@ async def test_online_ai_proxy(async_client: AsyncClient):
     from httpx import AsyncClient as HttpxAsyncClient, MockTransport, Response
     from sqlalchemy import select, func
     from tests.conftest import TestingSessionLocal
-    from app.models.account import Account
     from app.models.ai_usage import AIUsage
     from app.config import Settings
     from app.clients.deepseek import DeepSeekClient

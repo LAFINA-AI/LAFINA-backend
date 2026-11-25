@@ -29,15 +29,16 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from sqlalchemy import inspect, select, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.pool import NullPool
 
 from app.config import get_settings, normalize_database_url
-from app.database import Base
+from app.database import Base, build_engine_kwargs
 from app.models import (
     AIUsage,
     Account,
     AuthSession,
     ChangeFeed,
+    ChatMessagesSync,
+    ChatSessionsSync,
     CustomCategoriesSync,
     EventsSync,
     FeatureFlag,
@@ -55,6 +56,7 @@ from app.models import (
     SyncHead,
     TasksSync,
     TimeBlocksSync,
+    VoiceSession,
 )
 
 # Ordered so parent rows (`accounts`) are always inserted before child rows.
@@ -75,6 +77,9 @@ PERSONAL_MODELS_IN_ORDER = (
     FlashcardDecksSync,
     StudySummariesSync,
     RecordedMeetingsSync,
+    ChatSessionsSync,
+    ChatMessagesSync,
+    VoiceSession,
     IdempotentMutation,
     ChangeFeed,
     SyncHead,
@@ -95,9 +100,13 @@ RLS_FORCED_TABLES = (
     "flashcard_decks_sync",
     "study_summaries_sync",
     "recorded_meetings_sync",
+    "chat_sessions_sync",
+    "chat_messages_sync",
+    "voice_sessions",
     "idempotent_mutations",
     "change_feed",
     "sync_heads",
+    "ai_usage",
 )
 
 LEGACY_BUSINESS_AND_GMAIL_TABLES = (
@@ -171,8 +180,11 @@ async def migrate_database(
 
     if ensure_target_schema and not dry_run:
         async with target_engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
-            if conn.dialect.name == "postgresql":
+            if conn.dialect.name == "sqlite":
+                await conn.run_sync(Base.metadata.create_all)
+            else:
+                # PostgreSQL targets should be migrated via `alembic upgrade head` so
+                # RLS policies and indexes are always created; only drop legacy tables here.
                 for legacy_table in LEGACY_BUSINESS_AND_GMAIL_TABLES:
                     await conn.execute(text(f"DROP TABLE IF EXISTS {legacy_table} CASCADE"))
 
@@ -181,13 +193,13 @@ async def migrate_database(
     source_maker = async_sessionmaker(bind=source_engine, class_=AsyncSession, expire_on_commit=False)
     target_maker = async_sessionmaker(bind=target_engine, class_=AsyncSession, expire_on_commit=False)
 
-    # Read all personal tables from source. On PostgreSQL, temporarily relax
-    # FORCE ROW LEVEL SECURITY inside a read transaction that rolls back so the
-    # source database is never mutated.
+    # Read all personal tables from source. Never execute ACCESS EXCLUSIVE DDL
+    # (`ALTER TABLE ... NO FORCE ROW LEVEL SECURITY`) during `--dry-run`.
     extracted_rows: dict[str, list[dict[str, Any]]] = {}
     async with source_maker() as src_session:
         try:
-            await _set_rls_force(src_session, source_tables, force=False)
+            if not dry_run:
+                await _set_rls_force(src_session, source_tables, force=False)
             for model in PERSONAL_MODELS_IN_ORDER:
                 table_name = model.__tablename__
                 if table_name not in source_tables:
@@ -241,10 +253,15 @@ async def migrate_database(
                         """
                     )
                 )
-        finally:
             await _set_rls_force(dst_session, target_tables, force=True)
-
-        await dst_session.commit()
+            await dst_session.commit()
+        except Exception:
+            await dst_session.rollback()
+            # Re-enable FORCE RLS on a clean transaction so errors are never masked.
+            async with target_maker() as cleanup_session:
+                await _set_rls_force(cleanup_session, target_tables, force=True)
+                await cleanup_session.commit()
+            raise
 
     return report
 
@@ -272,8 +289,10 @@ async def _run_cli(args: argparse.Namespace) -> int:
         print("[Error] Source and target database URLs are identical; aborting.")
         return 1
 
-    source_engine = create_async_engine(source_url, poolclass=NullPool)
-    target_engine = create_async_engine(target_url, poolclass=NullPool)
+    src_url, src_kwargs = build_engine_kwargs(source_url, is_serverless=True)
+    dst_url, dst_kwargs = build_engine_kwargs(target_url, is_serverless=True)
+    source_engine = create_async_engine(src_url, **src_kwargs)
+    target_engine = create_async_engine(dst_url, **dst_kwargs)
     try:
         mode = "DRY RUN" if args.dry_run else "LIVE MIGRATION"
         print(f"[{mode}] Starting Render -> Neon personal data migration...")

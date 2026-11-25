@@ -6,7 +6,7 @@ from typing import Annotated
 import jwt
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
-from fastapi import Depends, HTTPException, status, Security
+from fastapi import Depends, HTTPException, Request, status, Security
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -26,7 +26,23 @@ ph = PasswordHasher(
 
 security_scheme = HTTPBearer(auto_error=False)
 
-def validate_password_strength(password: str) -> None:
+def client_ip_from_request(request: Request) -> str | None:
+    """Extract client IP, honoring proxy headers only behind Vercel."""
+    if settings.is_vercel_runtime():
+        forwarded = request.headers.get("x-forwarded-for")
+        if forwarded:
+            first = forwarded.split(",")[0].strip()
+            if first:
+                return first[:64]
+        real_ip = (request.headers.get("x-real-ip") or "").strip()
+        if real_ip:
+            return real_ip[:64]
+    if request.client and request.client.host:
+        return request.client.host[:64]
+    return None
+
+
+def validate_password_strength(password: str, *, check_blocklist: bool = True) -> None:
     """Validate the shared 6-128 character account password policy."""
     if len(password) < 6:
         raise HTTPException(
@@ -37,6 +53,11 @@ def validate_password_strength(password: str) -> None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Passwords must contain no more than 128 characters."
+        )
+    if check_blocklist and password.strip().lower() in settings.COMMON_PASSWORDS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This password is too common. Please choose a stronger password."
         )
 
 def normalize_email(email: str) -> str:
@@ -130,13 +151,14 @@ def decode_access_token(token: str) -> dict:
             settings.JWT_PUBLIC_KEY,
             algorithms=["RS256"],
             issuer=settings.JWT_ISSUER,
-            audience=settings.JWT_AUDIENCE
+            audience=settings.JWT_AUDIENCE,
+            options={"require": ["exp", "iat", "sub", "sid"]},
         )
         return payload
-    except jwt.PyJWTError as e:
+    except jwt.PyJWTError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Invalid authentication token: {str(e)}"
+            detail="Invalid or expired authentication token."
         )
 
 async def get_current_user_and_session(

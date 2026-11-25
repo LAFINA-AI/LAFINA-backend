@@ -102,11 +102,14 @@ def render_pdf(spec: DocumentSpec) -> bytes:
             width = len(block.columns) or max((len(row) for row in block.rows), default=0)
             if width == 0:
                 continue
+            # Narrow multi-column PDF tables can exceed usable page height on a single row
+            # (causing ReportLab LayoutError) if every cell holds 500 chars.
+            cell_cap = 160 if width >= 7 else 280 if width >= 5 else 500
             data = []
             if block.columns:
-                data.append([Paragraph(pdf_markup(column), header_cell) for column in block.columns])
+                data.append([Paragraph(pdf_markup(column[:120]), header_cell) for column in block.columns])
             data.extend(
-                [Paragraph(pdf_markup(_cell_text(value)), cell) for value in row]
+                [Paragraph(pdf_markup(_cell_text(value)[:cell_cap]), cell) for value in row]
                 for row in block.rows
             )
             table = Table(
@@ -201,12 +204,15 @@ _PLAIN_NUMBER = re.compile(r"^-?(0|[1-9]\d{0,14})(\.\d{1,10})?$")
 
 def _sheet_name(name: str, taken: set[str], index: int) -> str:
     base = _SHEET_NAME_UNSAFE.sub(" ", plain_text(name or ""))
-    base = " ".join(base.split()).strip("'")[:MAX_SHEET_NAME_CHARS] or f"Sheet{index}"
+    # Truncate first, then strip leading/trailing apostrophes so slicing never leaves a trailing `'`.
+    base = " ".join(base.split())[:MAX_SHEET_NAME_CHARS].strip("'").strip() or f"Sheet{index}"
+    if base.lower() == "history":
+        base = "History_1"
     candidate = base
     suffix = 2
     while candidate.lower() in taken:
         tail = f" ({suffix})"
-        candidate = base[: MAX_SHEET_NAME_CHARS - len(tail)] + tail
+        candidate = base[: MAX_SHEET_NAME_CHARS - len(tail)].rstrip("'").strip() + tail
         suffix += 1
     taken.add(candidate.lower())
     return candidate

@@ -14,6 +14,7 @@ the API key never reach a log line.
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Optional
+from urllib.parse import quote, urlsplit
 
 import httpx
 
@@ -99,29 +100,49 @@ class PineconeIndexClient:
         if not response.content:
             return {}
         try:
-            return response.json()
+            parsed = response.json()
         except ValueError:
             raise PineconeError("Pinecone returned a malformed response.")
+        if not isinstance(parsed, dict):
+            raise PineconeError("Pinecone returned an unexpected response shape.")
+        return parsed
+
+    @staticmethod
+    def _normalize_host(raw_host: str) -> str:
+        candidate = raw_host.strip().rstrip("/")
+        if not candidate:
+            raise PineconeError("Pinecone did not report a host for the index.")
+        if "://" not in candidate:
+            candidate = f"https://{candidate}"
+        parts = urlsplit(candidate)
+        if parts.scheme != "https" or not parts.netloc:
+            raise PineconeError("Pinecone index host must be a valid HTTPS URL.", status_code=503)
+        return f"https://{parts.netloc}{parts.path.rstrip('/')}"
 
     async def host(self) -> str:
         """The index's data-plane host, looked up once and remembered."""
         if self._host is None:
-            name = self.settings.PINECONE_INDEX_NAME.strip()
+            name = quote(self.settings.PINECONE_INDEX_NAME.strip(), safe="")
             described = await self._request(
                 "GET", f"{self.settings.PINECONE_CONTROL_URL.rstrip('/')}/indexes/{name}"
             )
             host = str(described.get("host") or "").strip()
-            if not host:
-                raise PineconeError("Pinecone did not report a host for the index.")
+            normalized = self._normalize_host(host)
             dimension = described.get("dimension")
-            if dimension and int(dimension) != self.settings.HANDBOOK_EMBED_DIMENSIONS:
-                raise PineconeError(
-                    f"The Pinecone index is {dimension}-dimensional but embeddings are "
-                    f"{self.settings.HANDBOOK_EMBED_DIMENSIONS}-dimensional.",
-                    status_code=503,
-                )
-            self._host = host
-        return self._host if self._host.startswith("http") else f"https://{self._host}"
+            if dimension is not None:
+                try:
+                    dim_int = int(dimension)
+                except (TypeError, ValueError):
+                    raise PineconeError("Pinecone reported a malformed index dimension.")
+                if dim_int and dim_int != self.settings.HANDBOOK_EMBED_DIMENSIONS:
+                    raise PineconeError(
+                        f"The Pinecone index is {dim_int}-dimensional but embeddings are "
+                        f"{self.settings.HANDBOOK_EMBED_DIMENSIONS}-dimensional.",
+                        status_code=503,
+                    )
+            self._host = normalized
+            return normalized
+        return self._normalize_host(self._host)
 
     async def embed(self, texts: list[str], *, input_type: str) -> list[list[float]]:
         """One vector per text, in order, from Pinecone's hosted embedding model."""
@@ -166,14 +187,28 @@ class PineconeIndexClient:
                 "includeValues": False,
             },
         )
-        return [
-            PineconeMatch(
-                id=str(match.get("id", "")),
-                score=float(match.get("score") or 0.0),
-                metadata=dict(match.get("metadata") or {}),
+        raw_matches = data.get("matches")
+        if raw_matches is None:
+            raw_matches = []
+        if not isinstance(raw_matches, list):
+            raise PineconeError("Pinecone returned a malformed matches list.")
+        results: list[PineconeMatch] = []
+        for match in raw_matches:
+            if not isinstance(match, dict):
+                continue
+            try:
+                score = float(match.get("score") or 0.0)
+            except (TypeError, ValueError):
+                score = 0.0
+            meta = match.get("metadata")
+            results.append(
+                PineconeMatch(
+                    id=str(match.get("id", "")),
+                    score=score,
+                    metadata=dict(meta) if isinstance(meta, dict) else {},
+                )
             )
-            for match in data.get("matches") or []
-        ]
+        return results
 
     async def upsert(self, vectors: list[dict[str, Any]], *, namespace: str) -> int:
         written = 0
@@ -184,7 +219,11 @@ class PineconeIndexClient:
                 f"{await self.host()}/vectors/upsert",
                 json={"vectors": batch, "namespace": namespace},
             )
-            written += int(data.get("upsertedCount", len(batch)))
+            raw_count = data.get("upsertedCount")
+            try:
+                written += int(raw_count) if raw_count is not None else len(batch)
+            except (TypeError, ValueError):
+                written += len(batch)
         return written
 
     async def delete_namespace(self, namespace: str) -> None:
@@ -202,5 +241,13 @@ class PineconeIndexClient:
 
     async def namespace_count(self, namespace: str) -> int:
         stats = await self._request("POST", f"{await self.host()}/describe_index_stats", json={})
-        entry = (stats.get("namespaces") or {}).get(namespace) or {}
-        return int(entry.get("vectorCount") or 0)
+        namespaces = stats.get("namespaces")
+        if not isinstance(namespaces, dict):
+            return 0
+        entry = namespaces.get(namespace)
+        if not isinstance(entry, dict):
+            return 0
+        try:
+            return int(entry.get("vectorCount") or 0)
+        except (TypeError, ValueError):
+            raise PineconeError("Pinecone returned a malformed namespace count.")

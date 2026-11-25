@@ -43,7 +43,9 @@ from app.api.v1.ai import (
     get_deepseek_client,
     get_elevenlabs_tts_client,
     get_handbook_retriever,
+    open_fresh_session,
 )
+from app.services.handbook_rag import HandbookRetriever, build_handbook_prompt
 from app.clients.deepseek import (
     DeepSeekAuthenticationError,
     DeepSeekBillingError,
@@ -63,7 +65,6 @@ from app.models.session import AuthSession
 from app.models.voice_session import VoiceSession
 from app.security.auth import get_current_user_and_session
 from app.services.capabilities import has_chat_access
-from app.services.handbook_rag import HandbookRetriever, build_handbook_prompt
 from app.services.voice_conversation import (
     CONVERSATION_HEADER,
     GRANT_FIELD,
@@ -95,16 +96,41 @@ TURN_USAGE = "voice_turn"
 # A model call that finishes a student turn after a tool result (no new words).
 TOOL_TURN_USAGE = "voice_tool_turn"
 CONVERSATION_ID_PATTERN = r"^[A-Za-z0-9_-]{1,128}$"
+_CONVERSATION_ID_RE = re.compile(CONVERSATION_ID_PATTERN)
 NO_STORE = {"Cache-Control": "no-store"}
+MAX_VOICE_SESSIONS_PER_MIN = 12
+MAX_REDELIVERIES_PER_TURN = 3
+_FALLBACK_AGENT_CLIENT: ElevenLabsAgentClient | None = None
+_TURN_REDELIVERIES: dict[tuple[str, str], tuple[float, int]] = {}
 
 
 def get_elevenlabs_agent_client(request: Request) -> ElevenLabsAgentClient:
+    global _FALLBACK_AGENT_CLIENT
     client: ElevenLabsAgentClient | None = getattr(
         request.app.state, "elevenlabs_agent_client", None
     )
     if client is None:
-        return ElevenLabsAgentClient(settings=settings)
+        if _FALLBACK_AGENT_CLIENT is None:
+            _FALLBACK_AGENT_CLIENT = ElevenLabsAgentClient(settings=settings)
+        return _FALLBACK_AGENT_CLIENT
     return client
+
+
+def _record_redelivery_and_check_limit(session_id: uuid.UUID, key: str) -> bool:
+    """Returns True when an unmetered redelivery is still within the per-turn retry cap."""
+    now_mono = time.monotonic()
+    if len(_TURN_REDELIVERIES) > 4096:
+        cutoff = now_mono - 600.0
+        for k in [k for k, (ts, _) in _TURN_REDELIVERIES.items() if ts < cutoff]:
+            _TURN_REDELIVERIES.pop(k, None)
+    cache_key = (str(session_id), key)
+    ts, count = _TURN_REDELIVERIES.get(cache_key, (now_mono, 0))
+    if now_mono - ts >= 600.0:
+        ts, count = now_mono, 0
+    if count >= MAX_REDELIVERIES_PER_TURN:
+        return False
+    _TURN_REDELIVERIES[cache_key] = (ts, count + 1)
+    return True
 
 
 def _utc(value: datetime) -> datetime:
@@ -231,27 +257,50 @@ async def create_voice_session(
             detail="Voice conversation is not set up on this server yet.",
         )
 
-    # Serializes session starts per account (PostgreSQL), so two quick taps or
-    # two devices cannot both pass the daily check.
-    await db.execute(select(Account.id).where(Account.id == account.id).with_for_update())
     now = datetime.now(timezone.utc)
     daily_sessions = settings.VOICE_CONVERSATION_SESSIONS_PER_DAY
-    if daily_sessions is not None:
-        _, started_today = await _usage_counts(db, account.id, SESSION_USAGE, now)
-        if started_today >= daily_sessions:
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail=(
-                    f"Daily voice conversation limit reached ({daily_sessions} a day). "
-                    "Text chat and offline voice still work."
-                ),
-            )
+    started_min, started_today = await _usage_counts(db, account.id, SESSION_USAGE, now)
+    if started_min >= MAX_VOICE_SESSIONS_PER_MIN:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many voice calls started in one minute. Please wait a moment.",
+        )
+    if daily_sessions is not None and started_today >= daily_sessions:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=(
+                f"Daily voice conversation limit reached ({daily_sessions} a day). "
+                "Text chat and offline voice still work."
+            ),
+        )
+    # Release read transaction before awaiting slow ElevenLabs HTTP calls so no
+    # database lock or idle-in-transaction connection is held across network I/O.
+    await db.commit()
 
     voice_id = await _validate_voice(tts, req.voiceId)
     try:
         signed_url = await agents.signed_url()
     except ElevenLabsAgentError as err:
         raise HTTPException(status_code=err.status_code, detail=err.message)
+
+    # Re-acquire a brief per-account row lock to enforce quotas atomically and
+    # supersede any earlier live conversation.
+    await db.execute(select(Account.id).where(Account.id == account.id).with_for_update())
+    now = datetime.now(timezone.utc)
+    started_min, started_today = await _usage_counts(db, account.id, SESSION_USAGE, now)
+    if started_min >= MAX_VOICE_SESSIONS_PER_MIN:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many voice calls started in one minute. Please wait a moment.",
+        )
+    if daily_sessions is not None and started_today >= daily_sessions:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=(
+                f"Daily voice conversation limit reached ({daily_sessions} a day). "
+                "Text chat and offline voice still work."
+            ),
+        )
 
     # One live conversation per account: a new start ends the earlier one, so
     # its grant stops buying answers even if that phone is still connected.
@@ -431,7 +480,11 @@ def _should_use_voice_handbook(text: str) -> bool:
     """Only policy questions pay the retrieval latency on the voice path."""
     if re.search(
         r"\b(?:add|create|schedule|remind|book|move|rename|delete|cancel|set)\b", text, re.I
-    ) and not re.search(r"\b(?:policy|handbook|allowed|rules|requirements)\b", text, re.I):
+    ) and not re.search(
+        r"\b(?:policy|policies|handbook|allowed|rules|requirements|grading|attendance|absences|retention|probation|scholarship)\b",
+        text,
+        re.I,
+    ):
         return False
     return bool(
         re.search(
@@ -489,11 +542,10 @@ async def voice_llm_turn(
         return _llm_error(409, "This voice conversation has expired.", "session_expired")
 
     conversation_id = request.headers.get(CONVERSATION_HEADER) or None
-    if conversation_id is not None and (
-        len(conversation_id) > 128
-        or not conversation_id.replace("-", "").replace("_", "").isalnum()
-    ):
-        conversation_id = None
+    if conversation_id is not None and not _CONVERSATION_ID_RE.fullmatch(conversation_id):
+        return _llm_error(
+            400, "Invalid conversation identifier.", "invalid_conversation_id"
+        )
     if conversation_id and row.conversation_id and row.conversation_id != conversation_id:
         return _llm_error(
             403, "This voice session belongs to a different conversation.", "conversation_mismatch"
@@ -529,28 +581,74 @@ async def voice_llm_turn(
             f"[voiceSession={row.id}]"
         )
         return say(TOOL_RESULT_FALLBACK)
-    turns = continuation or conversation_turns(
-        raw_messages,
-        max_messages=settings.VOICE_CONVERSATION_MAX_CONTEXT_MESSAGES,
-        max_chars=settings.VOICE_CONVERSATION_MAX_CONTEXT_CHARS,
-    )
+    if continuation:
+        # Preserve prior spoken turns ahead of the active tool exchange so
+        # multi-turn tool calls retain context from earlier in the call.
+        prior_turns: list[dict] = []
+        if isinstance(raw_messages, list):
+            last_user_idx = next(
+                (
+                    i
+                    for i in range(len(raw_messages) - 1, -1, -1)
+                    if isinstance(raw_messages[i], dict)
+                    and raw_messages[i].get("role") == "user"
+                ),
+                -1,
+            )
+            if last_user_idx > 0:
+                earlier = [
+                    m
+                    for m in raw_messages[:last_user_idx]
+                    if isinstance(m, dict)
+                    and m.get("role") in ("user", "assistant")
+                    and isinstance(m.get("content"), str)
+                    and m.get("content").strip()
+                ]
+                room_msgs = max(
+                    0, settings.VOICE_TOOL_EXCHANGE_MAX_MESSAGES - len(continuation)
+                )
+                room_chars = max(
+                    0,
+                    settings.VOICE_TOOL_EXCHANGE_MAX_CHARS
+                    - len(json.dumps(continuation, ensure_ascii=False)),
+                )
+                used_chars = 0
+                for msg in reversed(earlier[-min(room_msgs, settings.VOICE_CONVERSATION_MAX_CONTEXT_MESSAGES) :]):
+                    text_val = " ".join(msg["content"].split())
+                    if not text_val or used_chars + len(text_val) > room_chars:
+                        break
+                    prior_turns.append({"role": msg["role"], "content": text_val})
+                    used_chars += len(text_val)
+                prior_turns.reverse()
+                while prior_turns and prior_turns[0]["role"] != "user":
+                    prior_turns.pop(0)
+        turns = prior_turns + continuation
+    else:
+        turns = conversation_turns(
+            raw_messages,
+            max_messages=settings.VOICE_CONVERSATION_MAX_CONTEXT_MESSAGES,
+            max_chars=settings.VOICE_CONVERSATION_MAX_CONTEXT_CHARS,
+        )
     if not turns:
         # Nothing new to answer: ElevenLabs re-engaging after a silence (the
         # history ends with LAFINA's words), or noise. Nothing is paid.
         return say(SILENCE_CHECK_IN if _lafina_spoke_last(raw_messages) else NOT_HEARD)
 
-    # One student turn is paid once, however often ElevenLabs asks for it
-    # (retries after a slow attempt, speculative requests). Tool follow-ups
-    # finish a turn already paid for, so they do not count against the
-    # student's turn limits; their tokens are still recorded.
+    # Key by stable session_id (not mutable conversation_id) so binding
+    # conversation_id mid-retry never double-charges the same turn.
     key = turn_key(
-        conversation_id or row.conversation_id,
+        str(row.id),
         len(raw_messages) if isinstance(raw_messages, list) else 0,
     )
     redelivery = row.last_turn_key == key
     usage_row: AIUsage | None = None
     if not redelivery:
-        if not continuation:
+        if continuation:
+            tool_min, _ = await _usage_counts(db, owner_id, TOOL_TURN_USAGE, now)
+            if tool_min >= settings.VOICE_CONVERSATION_TURNS_PER_MIN * 2:
+                await _record_error(db, row, "rate_limited")
+                return say(_STUDENT_MESSAGES["rate_limited"])
+        else:
             minute_turns, day_turns = await _usage_counts(db, owner_id, TURN_USAGE, now)
             if minute_turns >= settings.VOICE_CONVERSATION_TURNS_PER_MIN:
                 await _record_error(db, row, "rate_limited")
@@ -602,36 +700,66 @@ async def voice_llm_turn(
                 await _record_error(db, row, "turn_limit")
                 return say(_STUDENT_MESSAGES["turn_limit"])
     if redelivery:
+        if not _record_redelivery_and_check_limit(session_id, key):
+            await _record_error(db, row, "rate_limited")
+            return say(_STUDENT_MESSAGES["rate_limited"])
         logger.info(
             f"Voice turn asked again; answering without a new charge [voiceSession={row.id}]"
         )
 
     request_id = f"voice-{session_id}-{uuid.uuid4().hex[:12]}"
     last_user = next((t["content"] for t in reversed(turns) if t["role"] == "user"), "")
-    use_handbook = row.use_handbook and not continuation and _should_use_voice_handbook(last_user)
+    use_handbook = (
+        row.use_handbook
+        and not continuation
+        and _should_use_voice_handbook(last_user)
+    )
+    # Commit/close the pre-stream DB transaction before streaming starts.
+    await db.commit()
     student_note = student_context_prompt(
         extra, settings.VOICE_CONVERSATION_MAX_STUDENT_CONTEXT_CHARS
     )
     updates_note = app_updates_prompt(raw_messages)
     logger.info(f"Voice turn messages: {message_role_counts(raw_messages)} [{request_id}]")
 
+    usage_row_id = usage_row.id if usage_row is not None else None
+
     async def save_tokens(usage: dict) -> None:
         prompt = int(usage.get("prompt_tokens", 0) or 0)
         completion = int(usage.get("completion_tokens", 0) or 0)
-        await set_transaction_rls_user(db, owner_id)
-        if usage_row is not None:
-            usage_row.prompt_tokens = prompt
-            usage_row.completion_tokens = completion
-        await db.execute(
-            update(VoiceSession)
-            .where(VoiceSession.id == session_id)
-            .values(
-                prompt_tokens=VoiceSession.prompt_tokens + prompt,
-                completion_tokens=VoiceSession.completion_tokens + completion,
+        async with open_fresh_session(db) as bg_db:
+            await set_transaction_rls_user(bg_db, owner_id)
+            if usage_row_id is not None:
+                await bg_db.execute(
+                    update(AIUsage)
+                    .where(AIUsage.id == usage_row_id, AIUsage.owner_id == owner_id)
+                    .values(prompt_tokens=prompt, completion_tokens=completion)
+                    .execution_options(synchronize_session=False)
+                )
+            await bg_db.execute(
+                update(VoiceSession)
+                .where(VoiceSession.id == session_id)
+                .values(
+                    prompt_tokens=VoiceSession.prompt_tokens + prompt,
+                    completion_tokens=VoiceSession.completion_tokens + completion,
+                )
+                .execution_options(synchronize_session=False)
             )
-            .execution_options(synchronize_session=False)
-        )
-        await db.commit()
+            await bg_db.commit()
+
+    async def record_stream_error(code: str) -> None:
+        async with open_fresh_session(db) as bg_db:
+            await set_transaction_rls_user(bg_db, owner_id)
+            await bg_db.execute(
+                update(VoiceSession)
+                .where(VoiceSession.id == session_id)
+                .values(
+                    last_error_code=code,
+                    last_error_message=_STUDENT_MESSAGES.get(code, _STUDENT_MESSAGES["provider_unavailable"]),
+                )
+                .execution_options(synchronize_session=False)
+            )
+            await bg_db.commit()
 
     async def settle(work) -> None:
         try:
@@ -652,17 +780,18 @@ async def voice_llm_turn(
         if use_handbook:
             retrieval_at = time.monotonic()
             try:
-                passages = await asyncio.wait_for(
-                    _handbook_passages(
-                        handbook,
-                        db,
-                        [ChatMessage(role="user", content=last_user[:4090])],
-                        request_id,
-                    ),
-                    timeout=min(settings.HANDBOOK_TIMEOUT_SECONDS, 2.0),
-                )
-            except TimeoutError:
-                logger.info("Voice handbook budget exceeded [%s]", request_id)
+                async with open_fresh_session(db) as rag_db:
+                    passages = await asyncio.wait_for(
+                        _handbook_passages(
+                            handbook,
+                            rag_db,
+                            [ChatMessage(role="user", content=last_user[:4090])],
+                            request_id,
+                        ),
+                        timeout=min(settings.HANDBOOK_TIMEOUT_SECONDS, 2.0),
+                    )
+            except Exception:
+                logger.info("Voice handbook budget exceeded or failed [%s]", request_id)
             logger.info(
                 "Voice retrieval duration=%dms used=%s [%s]",
                 int((time.monotonic() - retrieval_at) * 1000),
@@ -697,8 +826,10 @@ async def voice_llm_turn(
             sanitize_for_speech=True,
         )
         calls_seen = False
+        spoken_any = False
         try:
             first_at = time.monotonic()
+            first_deadline = first_at + settings.VOICE_FIRST_WORDS_TIMEOUT_SECONDS
             try:
                 pending = await asyncio.wait_for(
                     anext(events), timeout=settings.VOICE_FIRST_WORDS_TIMEOUT_SECONDS
@@ -708,12 +839,14 @@ async def voice_llm_turn(
                     err
                     if isinstance(err, DeepSeekError)
                     else (
-                        DeepSeekTimeoutError() if isinstance(err, TimeoutError) else DeepSeekError()
+                        DeepSeekTimeoutError()
+                        if isinstance(err, TimeoutError)
+                        else DeepSeekError("Empty model stream.")
                     )
                 )
                 code = _provider_error_code(failure)
                 logger.warning(f"Voice turn failed before the first words ({code}) [{request_id}]")
-                await settle(_record_error(db, row, code))
+                await settle(record_stream_error(code))
                 yield chunk(
                     text=TRANSIENT_RETRY
                     if code in {"provider_timeout", "provider_unavailable"}
@@ -730,6 +863,7 @@ async def voice_llm_turn(
             while True:
                 kind, value = pending
                 if kind == "delta":
+                    spoken_any = True
                     yield chunk(text=value)
                 elif kind == "started":
                     pass
@@ -743,7 +877,15 @@ async def voice_llm_turn(
                     yield "data: [DONE]\n\n"
                     await settle(save_tokens(value if isinstance(value, dict) else {}))
                     return
-                pending = await asyncio.wait_for(anext(events), timeout=12.0)
+                # Before the first audible words or tool call arrive, keep the
+                # overall first-words deadline so `("started", None)` cannot
+                # double the silence window past ElevenLabs' cascade timeout.
+                if not spoken_any and not calls_seen:
+                    remaining = max(0.05, first_deadline - time.monotonic())
+                    next_timeout = min(12.0, remaining)
+                else:
+                    next_timeout = 12.0
+                pending = await asyncio.wait_for(anext(events), timeout=next_timeout)
         except StopAsyncIteration:
             yield chunk(finish="tool_calls" if calls_seen else "stop")
             yield "data: [DONE]\n\n"
@@ -752,9 +894,18 @@ async def voice_llm_turn(
                 err = DeepSeekTimeoutError()
             code = _provider_error_code(err)
             logger.warning(f"Voice turn stopped part-way ({code}) [{request_id}]")
-            await settle(_record_error(db, row, code))
+            await settle(record_stream_error(code))
             # Words, never an error object: an error ends the call.
-            yield chunk(text=MIDSTREAM_APOLOGY)
+            fallback_text = (
+                MIDSTREAM_APOLOGY
+                if spoken_any
+                else (
+                    TRANSIENT_RETRY
+                    if code in {"provider_timeout", "provider_unavailable"}
+                    else _STUDENT_MESSAGES[code]
+                )
+            )
+            yield chunk(text=fallback_text)
             yield chunk(finish="stop")
             yield "data: [DONE]\n\n"
         finally:

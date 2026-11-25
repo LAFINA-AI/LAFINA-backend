@@ -277,25 +277,30 @@ def check(settings: Settings, agent_id: str, client: httpx.Client) -> int:
     }
     for definition in voice_tool_definitions():
         fn = definition["function"]
-        actual = actual_by_name.get(fn["name"], {}).get("parameters", {})
+        actual = (actual_by_name.get(fn["name"]) or {}).get("parameters") or {}
         expected = fn["parameters"]
         # Descriptions may be normalized by the provider; compare actual fields
         # and constraints so an older agent cannot pass a name-only check.
-        expected_props = expected.get("properties", {})
-        actual_props = actual.get("properties", {})
+        expected_props = expected.get("properties") or {}
+        actual_props = actual.get("properties") or {}
         if any(
             name not in actual_props
+            or not isinstance(actual_props[name], dict)
             or actual_props[name].get("type") != spec.get("type")
             or actual_props[name].get("enum") != spec.get("enum")
             for name, spec in expected_props.items()
         ):
             problems.append(f"tool schema differs: {fn['name']}")
-        if set(actual.get("required", [])) != set(expected.get("required", [])):
+        if set(actual.get("required") or []) != set(expected.get("required") or []):
             problems.append(f"tool required fields differ: {fn['name']}")
     if "client_tool_call" not in (conv.get("conversation", {}).get("client_events") or []):
         problems.append("client_tool_call event is not enabled")
     if summary["llm"] != "custom-llm":
         problems.append("agent does not use the custom LLM")
+    if not summary["custom_llm_has_secret"]:
+        problems.append("custom LLM api_key secret is missing on the agent")
+    if not summary["voice_override_allowed"]:
+        problems.append("tts.voice_id override is disabled on the agent")
     if not summary["enable_auth"]:
         problems.append(
             "enable_auth is off: anyone with the agent ID could start paid conversations"
@@ -361,8 +366,15 @@ def main() -> int:
         "opening line (dry run unless --apply). Then set VOICE_OPENING_LINE_OVERRIDE=true.",
     )
     args = parser.parse_args()
+    if not (1.0 <= args.turn_timeout <= 30.0):
+        sys.exit("--turn-timeout must be between 1 and 30 seconds.")
 
-    settings = Settings()
+    # Read-only --check / dry-run should work without requiring DEEPSEEK_API_KEY
+    # or production JWT keys in the operator's local shell.
+    try:
+        settings = Settings()
+    except ValueError:
+        settings = Settings(ENVIRONMENT="development")
     agent_id = (args.agent_id or settings.ELEVENLABS_AGENT_ID or "").strip()
 
     if args.check:
@@ -418,17 +430,42 @@ def main() -> int:
         sys.exit("--update needs ELEVENLABS_AGENT_ID or --agent-id.")
 
     with httpx.Client(headers={"xi-api-key": _key(settings)}, timeout=30) as client:
-        created = client.post(
-            f"{API}/v1/convai/secrets",
-            json={
-                "type": "new",
-                "name": SECRET_NAME,
-                "value": llm_secret.get_secret_value().strip(),
-            },
-        )
-        if created.status_code != 200:
-            _fail(created, "Storing the custom-LLM secret")
-        secret_id = created.json().get("secret_id")
+        secret_id: str | None = None
+        if args.update:
+            existing_agent = client.get(f"{API}/v1/convai/agents/{agent_id}")
+            if existing_agent.status_code == 200:
+                existing_secret_id = (
+                    ((existing_agent.json().get("conversation_config") or {}).get("agent") or {})
+                    .get("prompt", {})
+                    .get("custom_llm", {})
+                    .get("api_key", {})
+                    .get("secret_id")
+                )
+                if isinstance(existing_secret_id, str) and existing_secret_id:
+                    updated = client.patch(
+                        f"{API}/v1/convai/secrets/{existing_secret_id}",
+                        json={
+                            "type": "update",
+                            "name": SECRET_NAME,
+                            "value": llm_secret.get_secret_value().strip(),
+                        },
+                    )
+                    if updated.status_code == 200:
+                        secret_id = existing_secret_id
+        if not secret_id:
+            created = client.post(
+                f"{API}/v1/convai/secrets",
+                json={
+                    "type": "new",
+                    "name": SECRET_NAME,
+                    "value": llm_secret.get_secret_value().strip(),
+                },
+            )
+            if created.status_code != 200:
+                _fail(created, "Storing the custom-LLM secret")
+            secret_id = created.json().get("secret_id")
+        if not isinstance(secret_id, str) or not secret_id:
+            sys.exit("ElevenLabs did not return a valid secret_id.")
         config = agent_config(settings, args.server_url, secret_id, args)
         if args.update:
             response = client.patch(f"{API}/v1/convai/agents/{agent_id}", json=config)
@@ -440,6 +477,8 @@ def main() -> int:
             if response.status_code != 200:
                 _fail(response, "Creating the agent")
             agent_id = response.json().get("agent_id")
+            if not isinstance(agent_id, str) or not agent_id:
+                sys.exit("ElevenLabs did not return a valid agent_id.")
             print(
                 f"Created agent {agent_id}. Set ELEVENLABS_AGENT_ID={agent_id} in the Vercel project."
             )

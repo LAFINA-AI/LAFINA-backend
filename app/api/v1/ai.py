@@ -621,13 +621,15 @@ CHAT_AGENT_TOOLS = frozenset(
         "read_memories",
         "find_free_time",
         "prepare_lafina_action",
+        "search_ustp_sources",
     }
 )
 
 CHAT_AGENT_INSTRUCTION = (
     "You can use the provided tools to look at the student's own planner on their phone "
-    "(calendar, To-Dos, notes, saved memories, free time) and to prepare a review card for a "
-    "planner change. Use a tool whenever the answer depends on their data instead of guessing, "
+    "(calendar, To-Dos, notes, saved memories, free time), search verified on-device USTP sources "
+    "(2023 Student Handbook and USTP CDO campus knowledge via search_ustp_sources), and prepare a review card for a "
+    "planner change. Use a tool whenever the answer depends on their data or USTP rules/dates instead of guessing, "
     "and you may use several tools in a row (for example find free time, then prepare a card "
     "for the slot the student wants). prepare_lafina_action only shows a card: nothing is saved "
     "until the student taps Confirm, so never say that anything was saved, scheduled, changed or "

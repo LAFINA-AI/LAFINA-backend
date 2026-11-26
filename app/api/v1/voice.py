@@ -165,6 +165,8 @@ class VoiceCapabilitiesResponse(BaseModel):
     detail: str | None = None
     # The agent accepts the app's opening line (first_message override).
     openingLine: bool = False
+    # The agent and backend allowlist the on-device `search_ustp_sources` tool (ADR-047).
+    clientUstpTool: bool = False
 
 
 class VoiceSessionRequest(BaseModel):
@@ -220,6 +222,7 @@ async def voice_capabilities(
         sessionsPerDay=settings.VOICE_CONVERSATION_SESSIONS_PER_DAY,
         detail=None if enabled else "Voice conversation is not set up on this server yet.",
         openingLine=enabled and settings.VOICE_OPENING_LINE_OVERRIDE,
+        clientUstpTool=enabled,
     )
 
 

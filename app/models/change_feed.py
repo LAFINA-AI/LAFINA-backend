@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime, timezone
-from sqlalchemy import String, DateTime, BigInteger, Integer, JSON, ForeignKey
+from sqlalchemy import String, DateTime, BigInteger, Integer, JSON, ForeignKey, Index
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.dialects.postgresql import UUID
 from app.database import Base
@@ -10,6 +10,10 @@ def utc_now():
 
 class ChangeFeed(Base):
     __tablename__ = "change_feed"
+    __table_args__ = (
+        Index("ix_change_feed_owner_change_id", "owner_id", "change_id"),
+        Index("ix_change_feed_owner_entity_change", "owner_id", "entity_type", "entity_id", "change_id"),
+    )
 
     # SQLite only auto-generates values for an INTEGER PRIMARY KEY. The type
     # variant keeps production on a PostgreSQL BIGINT sequence while allowing

@@ -16,6 +16,7 @@ told to say the handbook does not cover something rather than invent policy.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from dataclasses import dataclass
@@ -131,7 +132,7 @@ def build_chunks(
         first, last = window[0], window[-1]
         # The section a passage belongs to is the one most of its words sit in.
         sections = [entry[3] for entry in window]
-        section = max(set(sections), key=sections.count)
+        section = max(sorted(set(sections)), key=sections.count)
         chunks.append(
             HandbookChunk(
                 id=f"hb-{first[2]:03d}-{len(chunks):04d}",
@@ -226,17 +227,23 @@ def retrieval_query(messages: Sequence) -> str:
     user_turns = [turn for turn in user_turns if turn]
     if not user_turns:
         return ""
-    latest = user_turns[-1]
+    latest = user_turns[-1][:2000]
     if len(latest.split()) < SHORT_FOLLOW_UP_WORDS and len(user_turns) > 1:
-        return f"{user_turns[-2]}\n{latest}"[:2000]
-    return latest[:2000]
+        budget_for_prev = max(0, 2000 - len(latest) - 1)
+        if budget_for_prev > 0:
+            return f"{user_turns[-2][:budget_for_prev]}\n{latest}"
+    return latest
 
 
 def _clean_passage(text: str) -> str:
-    text = _CONTROL.sub("", text or "")
-    text = _FENCE_TAG.sub("", text)
-    text = " ".join(text.split())
-    return text[:MAX_PASSAGE_CHARS]
+    cleaned = _CONTROL.sub("", text or "")
+    for _ in range(5):
+        updated = _FENCE_TAG.sub("", cleaned)
+        if updated == cleaned:
+            break
+        cleaned = updated
+    cleaned = " ".join(cleaned.split())
+    return cleaned[:MAX_PASSAGE_CHARS]
 
 
 @dataclass
@@ -259,6 +266,7 @@ class HandbookRetriever:
         self.settings = settings
         self.index = index
         self._health: HandbookHealth | None = None
+        self._health_lock = asyncio.Lock()
 
     async def health(self, *, now: float | None = None) -> HandbookHealth:
         """Is the index reachable and does it hold the handbook? Remembered for a minute."""
@@ -267,23 +275,36 @@ class HandbookRetriever:
         current = time.monotonic() if now is None else now
         if self._health and current - self._health.checked_at < HEALTH_TTL_SECONDS:
             return self._health
-        if not self.configured:
-            health = HandbookHealth(
-                False, 0, "The Student Handbook index is not configured on the server.", current
-            )
-        else:
-            try:
-                count = await self.index.namespace_count(self.settings.HANDBOOK_NAMESPACE)
-                health = (
-                    HandbookHealth(True, count, None, current)
-                    if count > 0
-                    else HandbookHealth(False, 0, "The Student Handbook has not been indexed yet.", current)
+        async with self._health_lock:
+            current = time.monotonic() if now is None else now
+            if self._health and current - self._health.checked_at < HEALTH_TTL_SECONDS:
+                return self._health
+            if not self.configured:
+                health = HandbookHealth(
+                    False, 0, "The Student Handbook index is not configured on the server.", current
                 )
-            except PineconeError as err:
-                logger.warning(f"Student Handbook health check failed: {err.message}")
-                health = HandbookHealth(False, 0, "The Student Handbook index cannot be reached.", current)
-        self._health = health
-        return health
+            else:
+                try:
+                    count = await asyncio.wait_for(
+                        self.index.namespace_count(self.settings.HANDBOOK_NAMESPACE),
+                        timeout=min(self.settings.HANDBOOK_TIMEOUT_SECONDS, 10.0),
+                    )
+                    health = (
+                        HandbookHealth(True, count, None, current)
+                        if count > 0
+                        else HandbookHealth(
+                            False, 0, "The Student Handbook has not been indexed yet.", current
+                        )
+                    )
+                except (PineconeError, TimeoutError) as err:
+                    logger.warning(
+                        f"Student Handbook health check failed: {getattr(err, 'message', type(err).__name__)}"
+                    )
+                    health = HandbookHealth(
+                        False, 0, "The Student Handbook index cannot be reached.", current
+                    )
+            self._health = health
+            return health
 
     @property
     def configured(self) -> bool:
@@ -340,7 +361,8 @@ def build_handbook_prompt(passages: Sequence[HandbookPassage], title: str) -> st
         # Cleaned here as well as at retrieval: whatever built the passage, no
         # text of the handbook's can close the fence the rules below rely on.
         section = _clean_passage(passage.section)[:MAX_SECTION_CHARS]
-        where = passage.page_label + (f", {section}" if section else "")
+        page_label = _clean_passage(passage.page_label)[:32]
+        where = page_label + (f", {section}" if section else "")
         blocks.append(f"[Excerpt {number} — {where}]\n{_clean_passage(passage.text)}")
     excerpts = "\n\n".join(blocks)
     return (

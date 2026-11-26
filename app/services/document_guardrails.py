@@ -71,9 +71,8 @@ MAX_NOTES_CHARS = 2000
 
 MAX_DOCUMENT_BYTES = 10 * 1024 * 1024
 
-# Characters XML 1.0 cannot hold. One of these in a string makes python-docx,
-# python-pptx and openpyxl refuse to write the file at all.
-_XML_ILLEGAL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]")
+# Characters XML 1.0 / UTF-8 cannot hold (including lone UTF-16 surrogates).
+_XML_ILLEGAL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]")
 
 
 def clip(value: object, limit: int, *, keep_lines: bool = False) -> str:
@@ -91,7 +90,16 @@ def clip(value: object, limit: int, *, keep_lines: bool = False) -> str:
 
 
 def _clip_cell(value: object, limit: int) -> object:
-    if value is None or isinstance(value, (bool, int, float)):
+    import math
+
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, int):
+        # Guard against >4300-digit ints that crash str(value) in Python 3.11+.
+        if value.bit_length() > 64:
+            return clip("number", limit)
         return value
     return clip(value, limit)
 

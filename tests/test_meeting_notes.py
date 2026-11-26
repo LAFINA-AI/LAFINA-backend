@@ -241,16 +241,20 @@ async def test_a_section_of_a_long_meeting_becomes_partial_notes(async_client: A
 
 
 @pytest.mark.asyncio
-async def test_meeting_notes_need_a_pro_plan_but_say_the_transcript_is_safe(async_client: AsyncClient):
+async def test_meeting_notes_require_active_account_and_allow_students(async_client: AsyncClient):
     anon = await async_client.post("/v1/ai/meeting-notes/generate", json={"content": TRANSCRIPT})
     assert anon.status_code == 401
 
     password = "super-strong-lafina-passphrase-2026"
     reg = await async_client.post("/v1/auth/register", json={"email": "mn_free@ustp.edu.ph", "password": password})
     headers = {"Authorization": f"Bearer {reg.json()['access_token']}"}
-    res = await async_client.post("/v1/ai/meeting-notes/generate", headers=headers, json={"content": TRANSCRIPT})
-    assert res.status_code == 403
-    assert "transcript stay available" in res.json()["detail"]
+    fake = ScriptedDeepSeek(json.dumps(GOOD_NOTES))
+    restore = _override(fake)
+    try:
+        res = await async_client.post("/v1/ai/meeting-notes/generate", headers=headers, json={"content": TRANSCRIPT})
+        assert res.status_code == 200, res.text
+    finally:
+        restore()
 
 
 @pytest.mark.asyncio

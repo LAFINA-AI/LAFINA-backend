@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shutil
 import sqlite3
 import sys
@@ -33,7 +34,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.api.v1.sync import (
     MODEL_MAP,
-    SUPPORTED_ENTITY_TYPES,
     CustomCategoryPayload,
     EventPayload,
     FlashcardDeckPayload,
@@ -54,8 +54,25 @@ from app.models.change_feed import ChangeFeed
 from app.models.mutations import IdempotentMutation
 from app.models.sync_head import SyncHead
 
-DEFAULT_SQLITE_PATH = Path(r"c:\Users\bnoel\AppData\Roaming\lafina-personal\lafina.sqlite")
-TARGET_LOCAL_USER_ID = "user_mtt5uztbrgy7p4db3"
+DEFAULT_SQLITE_PATH = Path(os.environ.get("LAFINA_SQLITE_PATH", "lafina.sqlite"))
+TARGET_LOCAL_USER_ID = os.environ.get("LAFINA_LOCAL_USER_ID", "")
+
+# Only tables this script extracts from SQLite (never delete cloud-only tables
+# such as chat_sessions_sync / chat_messages_sync that are not extracted here).
+MIGRATED_ENTITY_TYPES = (
+    "profile",
+    "task",
+    "event",
+    "time_block",
+    "reminder",
+    "note",
+    "custom_category",
+    "pomodoro_settings",
+    "pomodoro_session",
+    "flashcard_deck",
+    "study_summary",
+    "recorded_meeting",
+)
 
 RLS_SYNC_TABLES = [
     "idempotent_mutations",
@@ -73,6 +90,8 @@ RLS_SYNC_TABLES = [
     "flashcard_decks_sync",
     "study_summaries_sync",
     "recorded_meetings_sync",
+    "chat_sessions_sync",
+    "chat_messages_sync",
 ]
 
 LEGACY_BUSINESS_AND_GMAIL_TABLES = [
@@ -437,15 +456,19 @@ def extract_personal_items(conn: sqlite3.Connection, local_user_id: str) -> tupl
             transcript_raw = json.loads(r["transcript_json"]) if r.get("transcript_json") else None
             transcript = None
             if transcript_raw is not None:
-                transcript = [
-                    {
-                        "start_ms": max(0, int(round(float(seg.get("startMs", seg.get("start_ms", 0)))))),
-                        "end_ms": max(0, int(round(float(seg.get("endMs", seg.get("end_ms", 0)))))),
-                        "text": str(seg.get("text", ""))[:10_000],
-                    }
-                    for seg in transcript_raw[:20_000]
-                    if seg.get("text")
-                ]
+                from app.api.v1.sync import MAX_TRANSCRIPT_TEXT_CHARS
+                transcript = []
+                total_chars = 0
+                for seg in transcript_raw[:20_000]:
+                    text_val = str(seg.get("text", ""))[:10_000]
+                    if not text_val:
+                        continue
+                    if total_chars + len(text_val) > MAX_TRANSCRIPT_TEXT_CHARS:
+                        break
+                    start_ms = max(0, int(round(float(seg.get("startMs", seg.get("start_ms", 0))))))
+                    end_ms = max(start_ms, int(round(float(seg.get("endMs", seg.get("end_ms", start_ms))))))
+                    transcript.append({"start_ms": start_ms, "end_ms": end_ms, "text": text_val})
+                    total_chars += len(text_val)
             notes_raw = json.loads(r["notes_json"]) if r.get("notes_json") else None
             notes = None
             if notes_raw is not None:
@@ -474,9 +497,10 @@ def extract_personal_items(conn: sqlite3.Connection, local_user_id: str) -> tupl
                     "unresolved_questions": [str(x)[:5000] for x in notes_raw.get("unresolved_questions", [])[:200]],
                     "key_points": [str(x)[:5000] for x in notes_raw.get("key_points", [])[:200]],
                 }
+            started_raw = r.get("started_at") or updated_at.isoformat()
             payload = RecordedMeetingPayload(
                 title=(r.get("title") or "Meeting")[:200],
-                started_at=str(r["started_at"]),
+                started_at=str(started_raw)[:64],
                 duration_seconds=max(0.0, float(r.get("duration_seconds") or 0)),
                 source="upload" if r.get("source") == "upload" else "recording",
                 language=r["language"][:16] if r.get("language") else None,
@@ -506,7 +530,14 @@ def extract_personal_items(conn: sqlite3.Connection, local_user_id: str) -> tupl
     return user, prepared
 
 
-async def push_to_neon(user: dict[str, Any], items: list[PreparedSyncItem]) -> int:
+async def push_to_neon(
+    user: dict[str, Any],
+    items: list[PreparedSyncItem],
+    *,
+    role: str = "student",
+    system_role: str = "user",
+    subscription_plan: str = "student",
+) -> int:
     settings = get_settings()
     target_url, engine_kwargs = build_engine_kwargs(
         settings.get_migration_database_url(),
@@ -516,7 +547,7 @@ async def push_to_neon(user: dict[str, Any], items: list[PreparedSyncItem]) -> i
     owner_id = uuid.UUID(str(user["cloud_account_id"]))
     now = datetime.now(timezone.utc)
     created_at = parse_iso_datetime(user.get("created_at"), now)
-    max_change_id = items[-1].change_id if items else 0
+    max_change_id = 0
 
     try:
         async with engine.begin() as conn:
@@ -527,7 +558,7 @@ async def push_to_neon(user: dict[str, Any], items: list[PreparedSyncItem]) -> i
                 {"uid": str(owner_id)},
             )
 
-            # 1. Upsert Account
+            # 1. Upsert Account without hardcoded admin privilege escalation.
             existing_account = (
                 await conn.execute(select(Account).where(Account.id == owner_id))
             ).scalar_one_or_none()
@@ -538,9 +569,9 @@ async def push_to_neon(user: dict[str, Any], items: list[PreparedSyncItem]) -> i
                         id=owner_id,
                         email=str(user["email"]).strip().lower(),
                         password_hash=migrated_pw_hash,
-                        role="student_pro",
-                        system_role="admin",
-                        subscription_plan="student_pro",
+                        role=role,
+                        system_role=system_role,
+                        subscription_plan=subscription_plan,
                         is_active=True,
                         created_at=created_at,
                         updated_at=now,
@@ -552,9 +583,6 @@ async def push_to_neon(user: dict[str, Any], items: list[PreparedSyncItem]) -> i
                         """
                         UPDATE accounts
                         SET email = :email,
-                            role = 'student_pro',
-                            system_role = 'admin',
-                            subscription_plan = 'student_pro',
                             is_active = TRUE,
                             updated_at = :updated_at
                         WHERE id = :id
@@ -567,14 +595,27 @@ async def push_to_neon(user: dict[str, Any], items: list[PreparedSyncItem]) -> i
                     },
                 )
 
-            # 2. Clear existing sync state for this owner so the bulk load is idempotent
-            for model_cls in MODEL_MAP.values():
+            # 2. Clear only migrated entity tables for this owner (never wipe cloud chat history).
+            for entity_type in MIGRATED_ENTITY_TYPES:
+                model_cls = MODEL_MAP[entity_type]
                 await conn.execute(delete(model_cls).where(model_cls.owner_id == owner_id))
-            await conn.execute(delete(ChangeFeed).where(ChangeFeed.owner_id == owner_id))
-            await conn.execute(delete(SyncHead).where(SyncHead.owner_id == owner_id))
+            await conn.execute(
+                delete(ChangeFeed).where(
+                    ChangeFeed.owner_id == owner_id,
+                    ChangeFeed.entity_type.in_(MIGRATED_ENTITY_TYPES),
+                )
+            )
             await conn.execute(delete(IdempotentMutation).where(IdempotentMutation.owner_id == owner_id))
 
-            # 3. Group items by entity_type and bulk insert into *_sync tables
+            # 3. Allocate global change_ids strictly above the current global max
+            # so other accounts' change_feed rows never collide and the sequence never rewinds.
+            current_global_max = int(
+                (await conn.execute(text("SELECT COALESCE(MAX(change_id), 0) FROM change_feed"))).scalar_one()
+            )
+            for offset, item in enumerate(items, start=1):
+                item.change_id = current_global_max + offset
+            max_change_id = items[-1].change_id if items else current_global_max
+
             by_type: dict[str, list[dict[str, Any]]] = {}
             change_feed_rows: list[dict[str, Any]] = []
             for item in items:
@@ -613,6 +654,7 @@ async def push_to_neon(user: dict[str, Any], items: list[PreparedSyncItem]) -> i
                 await conn.execute(insert(ChangeFeed), change_feed_rows[i : i + batch_size])
             print(f"  [Neon] Inserted {len(change_feed_rows)} rows into change_feed")
 
+            await conn.execute(delete(SyncHead).where(SyncHead.owner_id == owner_id))
             await conn.execute(
                 insert(SyncHead).values(
                     owner_id=owner_id,
@@ -626,9 +668,17 @@ async def push_to_neon(user: dict[str, Any], items: list[PreparedSyncItem]) -> i
                 text("SELECT pg_get_serial_sequence('change_feed', 'change_id')")
             )
             seq_name = seq_res.scalar_one_or_none()
-            if seq_name and max_change_id > 0:
+            if seq_name:
                 await conn.execute(
-                    text("SELECT setval(:seq_name, :max_id, true)"),
+                    text(
+                        """
+                        SELECT setval(
+                            :seq_name,
+                            GREATEST(COALESCE((SELECT MAX(change_id) FROM change_feed), 1), :max_id, 1),
+                            (SELECT COUNT(*) > 0 FROM change_feed)
+                        )
+                        """
+                    ),
                     {"seq_name": seq_name, "max_id": max_change_id},
                 )
 
@@ -643,14 +693,14 @@ async def push_to_neon(user: dict[str, Any], items: list[PreparedSyncItem]) -> i
 def align_local_sqlite(sqlite_path: Path, local_user_id: str, items: list[PreparedSyncItem], max_change_id: int) -> None:
     conn = sqlite3.connect(str(sqlite_path))
     now_iso = datetime.now(timezone.utc).isoformat()
-    all_types_json = json.dumps(sorted(SUPPORTED_ENTITY_TYPES), separators=(",", ":"))
+    migrated_types_json = json.dumps(sorted(MIGRATED_ENTITY_TYPES), separators=(",", ":"))
 
     try:
         with conn:
             cur = conn.cursor()
 
-            # 1. Replace sync_metadata with exact Neon versions and change_ids
-            cur.execute("DELETE FROM sync_metadata")
+            # 1. Replace sync_metadata strictly for this local_user_id only.
+            cur.execute("DELETE FROM sync_metadata WHERE user_id = ?", (local_user_id,))
             cur.executemany(
                 """
                 INSERT INTO sync_metadata (
@@ -673,12 +723,11 @@ def align_local_sqlite(sqlite_path: Path, local_user_id: str, items: list[Prepar
                 ],
             )
 
-            # 2. Clear sync_outbox and sync_conflicts (all personal changes are now in Neon)
-            cur.execute("DELETE FROM sync_outbox")
-            cur.execute("DELETE FROM sync_conflicts")
+            # 2. Clear sync_outbox and sync_conflicts only for this local_user_id.
+            cur.execute("DELETE FROM sync_outbox WHERE user_id = ?", (local_user_id,))
+            cur.execute("DELETE FROM sync_conflicts WHERE user_id = ?", (local_user_id,))
 
-            # 3. Update sync_state to match Neon cursor and negotiated entity types
-            cur.execute("DELETE FROM sync_state WHERE user_id != ?", (local_user_id,))
+            # 3. Update sync_state to match Neon cursor and migrated entity types.
             cur.execute(
                 """
                 INSERT INTO sync_state (
@@ -700,38 +749,31 @@ def align_local_sqlite(sqlite_path: Path, local_user_id: str, items: list[Prepar
                     local_user_id,
                     max_change_id,
                     now_iso,
-                    all_types_json,
-                    all_types_json,
+                    migrated_types_json,
+                    migrated_types_json,
                     now_iso,
                     now_iso,
                 ),
             )
-
-            # 4. Empty legacy business & Gmail tables and demo business users
-            for tbl in LEGACY_BUSINESS_AND_GMAIL_TABLES:
-                exists = cur.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
-                    (tbl,),
-                ).fetchone()
-                if exists:
-                    cur.execute(f"DELETE FROM {tbl}")
-
-            cur.execute(
-                f"DELETE FROM users WHERE id IN ({','.join('?' for _ in DEMO_USER_IDS)})",
-                DEMO_USER_IDS,
-            )
     finally:
         conn.close()
 
-    # Keep lafina.sqlite.bak aligned if present
-    bak_path = sqlite_path.with_suffix(".sqlite.bak")
-    if bak_path.exists():
-        shutil.copy2(sqlite_path, bak_path)
-
 
 async def main() -> None:
-    sqlite_path = DEFAULT_SQLITE_PATH
-    backup_path = Path(str(sqlite_path) + ".backup-20261023")
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Push one local LAFINA SQLite account to Neon.")
+    parser.add_argument("--sqlite-path", default=str(DEFAULT_SQLITE_PATH), help="Path to local SQLite DB")
+    parser.add_argument("--local-user-id", default=TARGET_LOCAL_USER_ID, help="Local SQLite user ID")
+    parser.add_argument("--role", default="student", choices=["student", "student_pro", "admin"])
+    parser.add_argument("--system-role", default="user", choices=["user", "admin"])
+    parser.add_argument("--subscription-plan", default="student", choices=["student", "student_pro"])
+    args = parser.parse_args()
+
+    if not args.local_user_id:
+        raise SystemExit("Pass --local-user-id (or set LAFINA_LOCAL_USER_ID).")
+    sqlite_path = Path(args.sqlite_path)
+    backup_path = Path(str(sqlite_path) + ".pre-migration.bak")
     if not backup_path.exists():
         shutil.copy2(sqlite_path, backup_path)
         print(f"Created safety backup at {backup_path}")
@@ -740,7 +782,7 @@ async def main() -> None:
 
     conn = sqlite3.connect(str(sqlite_path))
     try:
-        user, items = extract_personal_items(conn, TARGET_LOCAL_USER_ID)
+        user, items = extract_personal_items(conn, args.local_user_id)
     finally:
         conn.close()
 
@@ -749,8 +791,14 @@ async def main() -> None:
         f"({user['email']}, cloud_account_id={user['cloud_account_id']})"
     )
 
-    max_change_id = await push_to_neon(user, items)
-    align_local_sqlite(sqlite_path, TARGET_LOCAL_USER_ID, items, max_change_id)
+    max_change_id = await push_to_neon(
+        user,
+        items,
+        role=args.role,
+        system_role=args.system_role,
+        subscription_plan=args.subscription_plan,
+    )
+    align_local_sqlite(sqlite_path, args.local_user_id, items, max_change_id)
     print(f"Local SQLite and Neon Postgres are now synchronized at cursor {max_change_id}!")
 
 

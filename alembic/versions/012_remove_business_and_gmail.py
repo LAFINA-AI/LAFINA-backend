@@ -5,7 +5,7 @@ Revises: 011_study_tools_sync
 Create Date: 2026-10-21
 
 Ensures any database migrated or restored from the legacy Render deployment has:
-1. All 15 business and Gmail tables dropped (`IF EXISTS ... CASCADE`).
+1. All 16 business and Gmail tables dropped (`IF EXISTS ... CASCADE`).
 2. Any accounts with `role = 'business'` or `subscription_plan = 'business'`
    converted to `'student_pro'` so paid AI features continue working.
 """

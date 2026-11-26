@@ -1,6 +1,7 @@
 import base64
 import io
 import logging
+import re
 import time
 import wave
 from typing import Optional
@@ -11,6 +12,9 @@ from app.config import Settings
 logger = logging.getLogger("lafina.gemini_tts")
 
 MAX_DECODED_PCM_SIZE_BYTES = 5 * 1024 * 1024  # 5 MiB cap
+MAX_ENCODED_PCM_CHARS = ((MAX_DECODED_PCM_SIZE_BYTES + 2) // 3) * 4 + 16
+MAX_GEMINI_TTS_TEXT_CHARS = 5000
+_RATE_RE = re.compile(r"(?:^|;\s*)rate=(\d+)", re.IGNORECASE)
 
 
 class GeminiTtsError(Exception):
@@ -90,7 +94,7 @@ class GeminiTtsClient:
     Production Gemini TTS API client wrapping httpx.AsyncClient connection pool.
     Proxies requests to gemini-3.1-flash-tts-preview with Aoede voice, validates
     PCM response metadata strictly, converts PCM to WAV, and maps errors cleanly.
-    
+
     Privacy Contract: Spoken text, Base64 payloads, and API keys are strictly excluded
     from all log statements.
     """
@@ -127,6 +131,9 @@ class GeminiTtsClient:
                 f"Gemini TTS call attempted without valid API key ({reason}) [requestId={request_id}]"
             )
             raise GeminiTtsConfigError("Gemini API key is not configured.")
+
+        if not text or not text.strip() or len(text) > MAX_GEMINI_TTS_TEXT_CHARS:
+            raise GeminiTtsInvalidRequestError("Speech text must contain 1 to 5,000 characters.")
 
         if self._client is None:
             await self.start()
@@ -216,17 +223,21 @@ class GeminiTtsClient:
             )
             raise GeminiTtsMalformedResponseError()
 
+        if not isinstance(data, dict):
+            raise GeminiTtsMalformedResponseError("Malformed Gemini TTS JSON object.")
+
         candidates = data.get("candidates")
-        if not candidates or not isinstance(candidates, list):
+        if not candidates or not isinstance(candidates, list) or not isinstance(candidates[0], dict):
             logger.error(f"Gemini TTS candidates missing or not array [requestId={request_id}]")
             raise GeminiTtsMalformedResponseError("Missing candidates in Gemini TTS response.")
 
-        parts = candidates[0].get("content", {}).get("parts", [])
+        content = candidates[0].get("content")
+        parts = content.get("parts") if isinstance(content, dict) else None
         if not parts or not isinstance(parts, list):
             logger.error(f"Gemini TTS content parts missing or empty [requestId={request_id}]")
             raise GeminiTtsMalformedResponseError("Missing content parts in Gemini TTS response.")
 
-        audio_parts = [p for p in parts if "inlineData" in p]
+        audio_parts = [p for p in parts if isinstance(p, dict) and isinstance(p.get("inlineData"), dict)]
         if len(audio_parts) != 1:
             logger.error(
                 f"Gemini TTS response contained {len(audio_parts)} inlineData parts (expected exactly 1) [requestId={request_id}]"
@@ -238,17 +249,27 @@ class GeminiTtsClient:
         if not raw_b64 or not isinstance(raw_b64, str):
             logger.error(f"Gemini TTS inlineData missing data field [requestId={request_id}]")
             raise GeminiTtsMalformedResponseError("Missing inline audio data.")
+        if len(raw_b64) > MAX_ENCODED_PCM_CHARS:
+            raise GeminiTtsMalformedResponseError("Encoded audio stream exceeds size limit of 5 MiB.")
 
         # Gemini 3.1 TTS returns audio/L16;codec=pcm;rate=24000.
-        mime_type = inline_data.get("mimeType", "")
+        raw_mime = inline_data.get("mimeType")
+        mime_type = raw_mime.strip() if isinstance(raw_mime, str) else ""
         normalized_mime_type = mime_type.lower()
         is_supported_pcm = (
             normalized_mime_type.startswith("audio/l16")
             or normalized_mime_type.startswith("audio/pcm")
         )
-        if mime_type and not is_supported_pcm:
+        if not is_supported_pcm:
             logger.error(f"Gemini TTS unexpected MIME type: {mime_type} [requestId={request_id}]")
-            raise GeminiTtsMalformedResponseError(f"Unsupported audio MIME type: {mime_type}")
+            raise GeminiTtsMalformedResponseError(f"Unsupported audio MIME type: {mime_type or 'missing'}")
+
+        sample_rate = 24000
+        rate_match = _RATE_RE.search(mime_type)
+        if rate_match:
+            parsed_rate = int(rate_match.group(1))
+            if 8000 <= parsed_rate <= 96000:
+                sample_rate = parsed_rate
 
         # Strict Base64 decoding
         try:
@@ -275,15 +296,17 @@ class GeminiTtsClient:
             )
             raise GeminiTtsMalformedResponseError("Decoded audio stream has unaligned sample length.")
 
-        # Convert 24 kHz, 16-bit mono PCM to WAV format
+        # Convert 16-bit mono PCM to WAV format using declared sample rate
         try:
-            wav_bytes = pcm_to_wav(pcm_bytes, sample_rate=24000, channels=1, sample_width=2)
+            wav_bytes = pcm_to_wav(pcm_bytes, sample_rate=sample_rate, channels=1, sample_width=2)
             wav_base64 = base64.b64encode(wav_bytes).decode("utf-8")
         except Exception as wav_err:
             logger.error(f"Gemini TTS WAV header creation failed: {wav_err} [requestId={request_id}]")
             raise GeminiTtsMalformedResponseError("Failed to encode WAV audio stream.")
 
-        usage_meta = data.get("usageMetadata", {})
+        usage_meta = data.get("usageMetadata")
+        if not isinstance(usage_meta, dict):
+            usage_meta = {}
         usage_dict = {
             "prompt_tokens": usage_meta.get("promptTokenCount", len(text)),
             "completion_tokens": usage_meta.get("candidatesTokenCount", 0),

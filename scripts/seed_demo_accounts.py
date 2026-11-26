@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import os
 import sys
@@ -7,8 +8,9 @@ from datetime import datetime, timezone
 # Ensure repository root is on sys.path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from sqlalchemy import select
-from app.database import AsyncSessionLocal
+from sqlalchemy import func, or_, select
+from app.config import get_settings
+from app.database import AsyncSessionLocal, engine
 from app.models.account import Account
 from app.security.auth import hash_password
 
@@ -46,51 +48,73 @@ DEMO_ACCOUNTS = [
 ]
 
 
-async def seed_demo_accounts() -> None:
-    """Seed personal student and student_pro demo accounts."""
+async def seed_demo_accounts(*, allow_production: bool = False) -> None:
+    """Seed personal student and student_pro demo accounts (refused in production by default)."""
+    settings = get_settings()
+    if settings.ENVIRONMENT == "production" and not allow_production:
+        raise RuntimeError(
+            "Refusing to seed public demo accounts with hardcoded passwords in ENVIRONMENT=production. "
+            "Pass --allow-production only if you explicitly intend this."
+        )
+
     print("[Seed] Connecting to database...")
-    async with AsyncSessionLocal() as db:
-        now = datetime.now(timezone.utc)
-        pwd_hash = hash_password(DEMO_PASSWORD)
+    try:
+        async with AsyncSessionLocal() as db:
+            now = datetime.now(timezone.utc)
+            pwd_hash = hash_password(DEMO_PASSWORD)
 
-        for acc_info in DEMO_ACCOUNTS:
-            stmt = select(Account).where(Account.email == acc_info["email"])
-            res = await db.execute(stmt)
-            existing = res.scalar_one_or_none()
-
-            if existing:
-                existing.password_hash = pwd_hash
-                existing.role = acc_info["role"]
-                existing.system_role = acc_info["system_role"]
-                existing.subscription_plan = acc_info["subscription_plan"]
-                existing.is_active = True
-                print(f"[Seed] Updated existing account '{acc_info['email']}'.")
-            else:
-                account = Account(
-                    id=acc_info["id"],
-                    email=acc_info["email"],
-                    password_hash=pwd_hash,
-                    role=acc_info["role"],
-                    system_role=acc_info["system_role"],
-                    subscription_plan=acc_info["subscription_plan"],
-                    is_active=True,
-                    created_at=now,
-                    updated_at=now,
+            for acc_info in DEMO_ACCOUNTS:
+                stmt = select(Account).where(
+                    or_(
+                        func.lower(Account.email) == acc_info["email"].lower(),
+                        Account.id == acc_info["id"],
+                    )
                 )
-                db.add(account)
-                print(f"[Seed] Created new account '{acc_info['email']}'.")
+                res = await db.execute(stmt)
+                existing = res.scalar_one_or_none()
 
-        await db.commit()
-        print("\n========================================================")
-        print("DEMO ACCOUNTS SEEDED SUCCESSFULLY")
-        print("========================================================")
-        print(f"Password for all accounts: {DEMO_PASSWORD}")
-        for idx, acc_info in enumerate(DEMO_ACCOUNTS, start=1):
-            print(f"\n{idx}. {acc_info['name']}:")
-            print(f"   - Email: {acc_info['email']}")
-            print(f"   - Plan:  {acc_info['subscription_plan']}")
-        print("========================================================\n")
+                if existing:
+                    existing.email = acc_info["email"]
+                    existing.password_hash = pwd_hash
+                    existing.role = acc_info["role"]
+                    existing.system_role = acc_info["system_role"]
+                    existing.subscription_plan = acc_info["subscription_plan"]
+                    existing.is_active = True
+                    print(f"[Seed] Updated existing account '{acc_info['email']}'.")
+                else:
+                    account = Account(
+                        id=acc_info["id"],
+                        email=acc_info["email"],
+                        password_hash=pwd_hash,
+                        role=acc_info["role"],
+                        system_role=acc_info["system_role"],
+                        subscription_plan=acc_info["subscription_plan"],
+                        is_active=True,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                    db.add(account)
+                    print(f"[Seed] Created new account '{acc_info['email']}'.")
+
+            await db.commit()
+            print("\n========================================================")
+            print("DEMO ACCOUNTS SEEDED SUCCESSFULLY")
+            print("========================================================")
+            for idx, acc_info in enumerate(DEMO_ACCOUNTS, start=1):
+                print(f"\n{idx}. {acc_info['name']}:")
+                print(f"   - Email: {acc_info['email']}")
+                print(f"   - Plan:  {acc_info['subscription_plan']}")
+            print("========================================================\n")
+    finally:
+        await engine.dispose()
 
 
 if __name__ == "__main__":
-    asyncio.run(seed_demo_accounts())
+    parser = argparse.ArgumentParser(description="Seed local/dev demo accounts.")
+    parser.add_argument(
+        "--allow-production",
+        action="store_true",
+        help="Explicitly override the production safety guard.",
+    )
+    args = parser.parse_args()
+    asyncio.run(seed_demo_accounts(allow_production=args.allow_production))

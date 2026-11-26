@@ -48,15 +48,53 @@ class ElevenLabsTtsError(Exception):
 
 
 class ElevenLabsTtsClient:
+    MAX_REQUEST_CACHE = 4096
+    BUDGET_WINDOW_SECONDS = 86_400.0
+
     def __init__(self, settings, client: httpx.AsyncClient | None = None):
         self.settings = settings
         self.client = client
         self.owns_client = client is None
-        self.used_characters = 0
-        self.requests: dict[str, float] = {}
+        self._used_by_owner: dict[str, tuple[float, int]] = {}
+        self.requests: dict[tuple[str, str], float] = {}
         self._voices: list[dict[str, str]] = []
         self._voices_at = 0.0
         self._voices_lock = asyncio.Lock()
+
+    @property
+    def used_characters(self) -> int:
+        now = time.monotonic()
+        return sum(
+            count
+            for started, count in self._used_by_owner.values()
+            if now - started < self.BUDGET_WINDOW_SECONDS
+        )
+
+    @used_characters.setter
+    def used_characters(self, value: int) -> None:
+        if value <= 0:
+            self._used_by_owner.clear()
+        else:
+            self._used_by_owner["__default__"] = (time.monotonic(), int(value))
+
+    def _owner_used(self, owner_key: str, now: float) -> int:
+        entry = self._used_by_owner.get(owner_key)
+        if not entry:
+            return 0
+        started, count = entry
+        if now - started >= self.BUDGET_WINDOW_SECONDS:
+            self._used_by_owner.pop(owner_key, None)
+            return 0
+        return count
+
+    def _add_owner_usage(self, owner_key: str, delta: int, now: float) -> None:
+        current = self._owner_used(owner_key, now)
+        started = self._used_by_owner[owner_key][0] if owner_key in self._used_by_owner else now
+        new_val = max(0, current + delta)
+        if new_val == 0:
+            self._used_by_owner.pop(owner_key, None)
+        else:
+            self._used_by_owner[owner_key] = (started, new_val)
 
     @property
     def configured(self):
@@ -88,21 +126,26 @@ class ElevenLabsTtsClient:
                         params = {"page_size": 100}
                         if cursor:
                             params["next_page_token"] = cursor
-                        response = await self.client.get(
+                        raw_body = bytearray()
+                        async with self.client.stream(
+                            "GET",
                             "https://api.elevenlabs.io/v2/voices",
                             params=params,
                             headers={"xi-api-key": self.settings.ELEVENLABS_API_KEY.get_secret_value().strip()},
                             timeout=10,
-                        )
-                        if response.status_code == 429:
-                            raise ElevenLabsTtsError("Voice catalogue usage limit reached.", 429)
-                        if response.status_code in (401, 403):
-                            raise ElevenLabsTtsError("The server key needs Voices read permission.", 503)
-                        if response.status_code != 200:
-                            raise ElevenLabsTtsError("Voice catalogue is unavailable. Try again.")
-                        if len(response.content) > 2_000_000:
-                            raise ElevenLabsTtsError("Voice catalogue response is too large.")
-                        data = response.json()
+                        ) as response:
+                            if response.status_code == 429:
+                                raise ElevenLabsTtsError("Voice catalogue usage limit reached.", 429)
+                            if response.status_code in (401, 403):
+                                raise ElevenLabsTtsError("The server key needs Voices read permission.", 503)
+                            if response.status_code != 200:
+                                raise ElevenLabsTtsError("Voice catalogue is unavailable. Try again.")
+                            async for chunk in response.aiter_bytes():
+                                raw_body.extend(chunk)
+                                if len(raw_body) > 2_000_000:
+                                    raise ElevenLabsTtsError("Voice catalogue response is too large.")
+                        import json
+                        data = json.loads(raw_body.decode("utf-8"))
                         if not isinstance(data, dict) or not isinstance(data.get("voices"), list):
                             raise ElevenLabsTtsError("Invalid voice catalogue response.")
                         for voice in data["voices"][:100]:
@@ -124,9 +167,11 @@ class ElevenLabsTtsClient:
                 self._voices = sorted(voices.values(), key=_catalogue_order)
                 self._voices_at = time.monotonic()
                 return list(self._voices)
+            except ElevenLabsTtsError:
+                raise
             except (TimeoutError, httpx.TimeoutException):
                 raise ElevenLabsTtsError("Voice catalogue timed out. Try again.", 504) from None
-            except (httpx.HTTPError, ValueError):
+            except (httpx.HTTPError, ValueError, UnicodeDecodeError):
                 raise ElevenLabsTtsError("Voice catalogue is unavailable. Try again.") from None
 
     def model_for(self, latency: str = "standard") -> str:
@@ -143,6 +188,7 @@ class ElevenLabsTtsClient:
         request_id: str,
         voice_id: str | None = None,
         latency: str = "standard",
+        owner_id: str | None = None,
     ):
         if not self.configured:
             raise ElevenLabsTtsError("ElevenLabs speech is not configured.", 503)
@@ -158,19 +204,28 @@ class ElevenLabsTtsClient:
             ):
                 raise ElevenLabsTtsError("That online voice is no longer available. Choose another voice in Profile.", 422)
         now = time.monotonic()
+        owner_key = str(owner_id) if owner_id else "__default__"
+        req_key = (owner_key, str(request_id)[:128])
         self.requests = {
             key: created for key, created in self.requests.items() if now - created < 600
         }
-        if request_id in self.requests:
+        if len(self.requests) >= self.MAX_REQUEST_CACHE:
+            oldest = sorted(self.requests.items(), key=lambda item: item[1])[
+                : len(self.requests) - self.MAX_REQUEST_CACHE + 1
+            ]
+            for old_key, _ in oldest:
+                self.requests.pop(old_key, None)
+        if req_key in self.requests:
             raise ElevenLabsTtsError("Speech request already submitted; no automatic retry.", 409)
-        if self.used_characters + len(text) > self.settings.ELEVENLABS_MAX_CHARACTERS_PER_PROCESS:
+        if self._owner_used(owner_key, now) + len(text) > self.settings.ELEVENLABS_MAX_CHARACTERS_PER_PROCESS:
             raise ElevenLabsTtsError("Online speech character budget reached.", 429)
-        # Reserve before awaiting. Provider failures may still incur charges.
-        self.used_characters += len(text)
-        self.requests[request_id] = now
+        # Reserve per-owner budget before awaiting; refund on pre-bill auth/outage failures.
+        self._add_owner_usage(owner_key, len(text), now)
+        self.requests[req_key] = now
         await self.start()
         model = self.model_for(latency)
         audio = bytearray()
+        refund = False
         try:
             async with asyncio.timeout(14):
                 async with self.client.stream(
@@ -187,14 +242,18 @@ class ElevenLabsTtsClient:
                     timeout=12,
                 ) as response:
                     if response.status_code == 429:
+                        refund = True
                         raise ElevenLabsTtsError("ElevenLabs speech usage limit reached.", 429)
                     if response.status_code in (401, 403):
+                        refund = True
                         raise ElevenLabsTtsError(
                             "ElevenLabs speech configuration needs attention.", 503
                         )
                     if response.status_code != 200:
+                        if response.status_code >= 500:
+                            refund = True
                         raise ElevenLabsTtsError("ElevenLabs speech is unavailable.")
-                    if not response.headers.get("content-type", "").startswith("audio/"):
+                    if not response.headers.get("content-type", "").lower().startswith("audio/"):
                         raise ElevenLabsTtsError("Invalid speech audio response.")
                     async for chunk in response.aiter_bytes():
                         audio.extend(chunk)
@@ -210,4 +269,9 @@ class ElevenLabsTtsClient:
         except (TimeoutError, httpx.TimeoutException):
             raise ElevenLabsTtsError("ElevenLabs speech timed out.", 504) from None
         except httpx.HTTPError:
+            refund = True
             raise ElevenLabsTtsError("ElevenLabs speech is unavailable.") from None
+        finally:
+            if refund:
+                self._add_owner_usage(owner_key, -len(text), time.monotonic())
+                self.requests.pop(req_key, None)

@@ -34,11 +34,15 @@ RUNNING_LINE_RATIO = 0.6
 DEFAULT_CHUNK_CHARS = 6000
 DEFAULT_CHUNK_OVERLAP_CHARS = 400
 OCR_RESOLUTION_DPI = 200
+MAX_OCR_PIXELS = 12_000_000  # ~36 MB RGB cap per rendered page
+MAX_PDF_EXTRACTED_CHARS = 400_000
 
+# Linear-time (non-backtracking) page-number detector; line is already stripped.
 _PAGE_NUMBER_LINE = re.compile(
-    r"^\s*(?:page\s*)?\d+\s*(?:/|of|\|)?\s*\d*\s*$",
+    r"^(?:page[ \t]+)?\d+(?:[ \t]*(?:/|of|\|)[ \t]*\d+)?$",
     re.IGNORECASE,
 )
+_HORIZONTAL_WS = re.compile(r"[^\S\n]+")
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
 
 
@@ -106,10 +110,19 @@ def ocr_available() -> bool:
 
 def _ocr_page(page) -> str:
     """Reads one page as an image. Returns "" when OCR cannot run at all."""
+    import math
     import pytesseract
 
+    dpi = OCR_RESOLUTION_DPI
+    width_pt = float(getattr(page, "width", 0) or 0)
+    height_pt = float(getattr(page, "height", 0) or 0)
+    if width_pt > 0 and height_pt > 0:
+        area_sq_in = (width_pt / 72.0) * (height_pt / 72.0)
+        if area_sq_in * dpi * dpi > MAX_OCR_PIXELS:
+            dpi = max(36, int(math.sqrt(MAX_OCR_PIXELS / max(area_sq_in, 1e-6))))
+
     try:
-        image = page.to_image(resolution=OCR_RESOLUTION_DPI).original
+        image = page.to_image(resolution=dpi).original
     except Exception as exc:
         logger.warning("Page %s could not be rendered for OCR: %s", page.page_number, exc)
         return ""
@@ -123,7 +136,7 @@ def _ocr_page(page) -> str:
 # ── Cleaning ──────────────────────────────────────────────────────────────
 
 
-def clean_page_text(raw: str) -> str:
+def clean_page_text(raw: str, *, strip_page_numbers: bool = True) -> str:
     """Collapses the whitespace a PDF extractor leaves behind.
 
     Layout-driven extraction produces runs of spaces where a column gap was,
@@ -133,11 +146,14 @@ def clean_page_text(raw: str) -> str:
     if not raw:
         return ""
     text = raw.replace("\r\n", "\n").replace("\r", "\n")
-    text = text.replace(" ", " ").replace("﻿", "")
+    text = text.replace("\u00a0", " ").replace("\ufeff", "")
     # A hyphen at end of line is a word broken by the typesetter, not a hyphen.
     text = re.sub(r"(\w)-\n(\w)", r"\1\2", text)
-    lines = [re.sub(r"[ \t]+", " ", line).strip() for line in text.split("\n")]
-    kept = [line for line in lines if line and not _PAGE_NUMBER_LINE.match(line)]
+    lines = [_HORIZONTAL_WS.sub(" ", line).strip() for line in text.split("\n")]
+    if strip_page_numbers:
+        kept = [line for line in lines if line and not _PAGE_NUMBER_LINE.match(line)]
+    else:
+        kept = [line for line in lines if line]
     return "\n".join(kept)
 
 
@@ -300,6 +316,7 @@ def extract_pdf_text(
                     f"Only the first {max_pages} of {document.total_pages} pages were read."
                 )
 
+            extracted_total = 0
             for page in pdf.pages[:max_pages]:
                 try:
                     raw = page.extract_text() or ""
@@ -316,8 +333,19 @@ def extract_pdf_text(
                             raw = ocr_text
                             used_ocr = True
 
+                cleaned_page = clean_page_text(raw)
+                remaining_budget = MAX_PDF_EXTRACTED_CHARS - extracted_total
+                if remaining_budget <= 0:
+                    document.warnings.append(
+                        f"The document text was very long, so only the first {len(document.pages)} pages were read."
+                    )
+                    break
+                if len(cleaned_page) > remaining_budget:
+                    cleaned_page = cleaned_page[:remaining_budget]
+                extracted_total += len(cleaned_page)
+
                 document.pages.append(
-                    PageText(number=page.page_number, text=clean_page_text(raw), ocr_used=used_ocr)
+                    PageText(number=page.page_number, text=cleaned_page, ocr_used=used_ocr)
                 )
                 if used_ocr:
                     document.ocr_page_numbers.append(page.page_number)

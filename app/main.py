@@ -82,23 +82,88 @@ app.state.handbook_retriever = handbook_retriever
 UPLOAD_PATHS = ("/v1/ai/flashcards", "/v1/ai/study-notes")
 
 
-# Enforce max body size middleware
-@app.middleware("http")
-async def limit_body_size_middleware(request: Request, call_next):
-    content_length = request.headers.get("content-length")
-    is_upload = request.url.path in UPLOAD_PATHS
-    limit = settings.MAX_UPLOAD_BODY_SIZE_BYTES if is_upload else settings.MAX_BODY_SIZE_BYTES
-    if content_length:
+class _BodyTooLargeError(Exception):
+    pass
+
+
+class MaxBodySizeMiddleware:
+    """Pure ASGI body-size limiter enforcing both Content-Length and chunked streams."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        path = scope.get("path", "")
+        is_upload = path in UPLOAD_PATHS
+        limit = settings.MAX_UPLOAD_BODY_SIZE_BYTES if is_upload else settings.MAX_BODY_SIZE_BYTES
+        headers = {k.lower(): v for k, v in scope.get("headers", [])}
+        raw_length = headers.get(b"content-length")
+        if raw_length is not None:
+            try:
+                declared = int(raw_length.decode("latin-1").strip())
+            except (ValueError, UnicodeDecodeError):
+                response = JSONResponse(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    content={"detail": "Invalid Content-Length header."},
+                )
+                await response(scope, receive, send)
+                return
+            if declared < 0:
+                response = JSONResponse(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    content={"detail": "Invalid Content-Length header."},
+                )
+                await response(scope, receive, send)
+                return
+            if declared > limit:
+                response = JSONResponse(
+                    status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                    content={
+                        "detail": (
+                            f"Request payload exceeds maximum allowed size of "
+                            f"{limit // (1024 * 1024)} MiB."
+                        )
+                    },
+                )
+                await response(scope, receive, send)
+                return
+
+        received_bytes = 0
+        response_started = False
+        too_large = False
+
+        async def limited_receive():
+            nonlocal received_bytes, too_large
+            message = await receive()
+            if message.get("type") == "http.request":
+                chunk = message.get("body", b"") or b""
+                received_bytes += len(chunk)
+                if received_bytes > limit:
+                    too_large = True
+                    raise _BodyTooLargeError()
+            return message
+
+        async def tracking_send(message):
+            nonlocal response_started
+            if too_large:
+                # Suppress FastAPI's generic 400 body-parse error so we emit 413 cleanly.
+                return
+            if message.get("type") == "http.response.start":
+                response_started = True
+            await send(message)
+
         try:
-            declared = int(content_length)
-        except ValueError:
-            return JSONResponse(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                content={"detail": "Invalid Content-Length header."},
-            )
-        if declared > limit:
-            return JSONResponse(
-                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            await self.app(scope, limited_receive, tracking_send)
+        except _BodyTooLargeError:
+            pass
+
+        if too_large and not response_started:
+            response = JSONResponse(
+                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
                 content={
                     "detail": (
                         f"Request payload exceeds maximum allowed size of "
@@ -106,7 +171,7 @@ async def limit_body_size_middleware(request: Request, call_next):
                     )
                 },
             )
-    return await call_next(request)
+            await response(scope, receive, send)
 
 
 # Security headers middleware
@@ -120,12 +185,17 @@ async def security_headers_middleware(request: Request, call_next):
     return response
 
 
+# Register streaming body-size limiter outermost so chunked oversized requests
+# are stopped before Starlette/FastAPI buffers them.
+app.add_middleware(MaxBodySizeMiddleware)
+
+
 # Disable CORS by default unless explicitly enabled
 if settings.ENVIRONMENT == "development":
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
-        allow_credentials=True,
+        allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
     )

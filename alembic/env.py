@@ -11,14 +11,16 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 from alembic import context
 
-from app.config import get_settings
+from app.config import get_settings, is_pooled_database_url
 from app.database import Base
 import app.models  # noqa: F401
 
 config = context.config
 settings = get_settings()
 # Always prefer the direct (unpooled) Neon connection string for migrations.
-config.set_main_option("sqlalchemy.url", settings.get_migration_database_url())
+# Escape `%` as `%%` so URL-encoded passwords (e.g. `%40`) do not crash ConfigParser.
+_migration_url = settings.get_migration_database_url()
+config.set_main_option("sqlalchemy.url", _migration_url.replace("%", "%%"))
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
@@ -45,10 +47,12 @@ def do_run_migrations(connection: Connection) -> None:
 
 
 async def run_async_migrations() -> None:
+    connect_args = {"statement_cache_size": 0} if is_pooled_database_url(_migration_url) else {}
     connectable = async_engine_from_config(
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
+        connect_args=connect_args,
     )
     async with connectable.connect() as connection:
         await connection.run_sync(do_run_migrations)

@@ -219,7 +219,7 @@ def _string_list(value: object, limit: int = MAX_ITEM) -> list[str]:
 def _first(entry: dict, keys: tuple[str, ...]) -> str:
     for key in keys:
         value = entry.get(key)
-        if isinstance(value, (str, int, float)) and str(value).strip():
+        if isinstance(value, (str, int, float)) and not isinstance(value, bool) and str(value).strip():
             return str(value)
     return ""
 
@@ -251,6 +251,8 @@ def parse_meeting_notes_json(raw: str) -> MeetingNotes:
     )
 
     for entry in _as_list(data.get("key_topics") or data.get("topics") or data.get("key_discussion_topics")):
+        if len(notes.key_topics) >= MAX_LIST:
+            break
         if isinstance(entry, str):
             topic = clean_text(entry, MAX_TOPIC)
             if topic:
@@ -262,10 +264,10 @@ def parse_meeting_notes_json(raw: str) -> MeetingNotes:
         discussion = clean_text(_first(entry, ("discussion", "details", "summary", "notes")), MAX_DISCUSSION)
         if topic or discussion:
             notes.key_topics.append(KeyTopic(topic=topic or "Discussion", discussion=discussion))
-        if len(notes.key_topics) >= MAX_LIST:
-            break
 
     for entry in _as_list(data.get("action_items") or data.get("actions") or data.get("tasks")):
+        if len(notes.action_items) >= MAX_LIST:
+            break
         if isinstance(entry, str):
             task = clean_text(entry, MAX_ITEM)
             if task:
@@ -291,8 +293,6 @@ def parse_meeting_notes_json(raw: str) -> MeetingNotes:
                 status="done" if status in ("done", "completed", "complete") else "pending",
             )
         )
-        if len(notes.action_items) >= MAX_LIST:
-            break
 
     notes.decisions = _string_list(data.get("decisions") or data.get("decisions_made"))
     notes.important_dates = _string_list(data.get("important_dates") or data.get("dates"))

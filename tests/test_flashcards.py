@@ -358,7 +358,10 @@ def _payload(pdf: bytes, **extra) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_flashcards_need_a_pro_subscription(async_client: AsyncClient):
+async def test_flashcards_require_active_account_and_allow_students(async_client: AsyncClient):
+    from app.api.v1.ai import get_deepseek_client
+    from app.main import app
+
     pdf = build_pdf(["Mitochondria produce ATP by oxidative phosphorylation in the cristae."])
 
     anon = await async_client.post("/v1/ai/flashcards", json=_payload(pdf))
@@ -369,9 +372,13 @@ async def test_flashcards_need_a_pro_subscription(async_client: AsyncClient):
         "/v1/auth/register", json={"email": "fc_student@ustp.edu.ph", "password": password}
     )
     headers = {"Authorization": f"Bearer {reg.json()['access_token']}"}
-    res = await async_client.post("/v1/ai/flashcards", headers=headers, json=_payload(pdf))
-    assert res.status_code == 403
-    assert "student_pro" in res.json()["detail"]
+    fake = FakeDeepSeek(replies=['[{"question": "What produces ATP?", "answer": "Mitochondria."}]'])
+    app.dependency_overrides[get_deepseek_client] = lambda: fake
+    try:
+        res = await async_client.post("/v1/ai/flashcards", headers=headers, json=_payload(pdf))
+        assert res.status_code == 200, res.text
+    finally:
+        app.dependency_overrides.pop(get_deepseek_client, None)
 
 
 @pytest.mark.asyncio

@@ -14,6 +14,7 @@ import io
 import logging
 import re
 import zipfile
+import zlib
 from xml.etree import ElementTree
 
 from app.services.pdf_text import (
@@ -33,6 +34,9 @@ SUPPORTED_EXTENSIONS = (".pdf", ".docx", ".pptx")
 # Enough for a long chapter; past this the model would never see the tail
 # anyway, and holding a whole book in memory helps nobody.
 MAX_EXTRACTED_CHARS = 400_000
+MAX_ZIP_MEMBER_BYTES = 20 * 1024 * 1024  # 20 MiB per XML part
+MAX_ZIP_TOTAL_BYTES = 30 * 1024 * 1024   # 30 MiB cumulative across parts
+MAX_PPTX_SLIDES_DEFAULT = 40
 
 _W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 _A = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
@@ -88,6 +92,45 @@ def _open_package(data: bytes, what: str) -> zipfile.ZipFile:
         ) from exc
 
 
+def _safe_read_zip_member(
+    archive: zipfile.ZipFile,
+    name: str,
+    *,
+    what: str,
+    max_bytes: int = MAX_ZIP_MEMBER_BYTES,
+) -> bytes:
+    """Reads one ZIP entry with streaming byte caps to defeat zip bombs and handle corruption."""
+    try:
+        info = archive.getinfo(name)
+    except KeyError as exc:
+        raise KeyError(name) from exc
+    if info.flag_bits & 0x1:
+        raise PdfTextError(
+            f"That {what} file is password protected. Remove the password and try again."
+        )
+    if info.file_size > max_bytes:
+        raise PdfTextError(f"That {what} file is too large to process safely.")
+    buf = bytearray()
+    try:
+        with archive.open(info, "r") as stream:
+            while True:
+                chunk = stream.read(65536)
+                if not chunk:
+                    break
+                buf.extend(chunk)
+                if len(buf) > max_bytes:
+                    raise PdfTextError(f"That {what} file is too large to process safely.")
+    except PdfTextError:
+        raise
+    except RuntimeError as exc:
+        raise PdfTextError(
+            f"That {what} file is password protected or unreadable. Remove any password and try again."
+        ) from exc
+    except (zipfile.BadZipFile, zlib.error, EOFError, OSError) as exc:
+        raise PdfTextError(f"That {what} file is damaged and could not be read.") from exc
+    return bytes(buf)
+
+
 def _element_text(element: ElementTree.Element, tag: str) -> str:
     """Joins the text runs under one node, honouring breaks and tabs."""
     parts: list[str] = []
@@ -101,6 +144,30 @@ def _element_text(element: ElementTree.Element, tag: str) -> str:
     return "".join(parts)
 
 
+def _paragraph_own_text(paragraph: ElementTree.Element) -> str:
+    """Collects text runs owned directly by ``paragraph`` without re-reading nested ``<w:p>`` text boxes."""
+    parts: list[str] = []
+    stack = list(reversed(list(paragraph)))
+    p_tag = f"{_W}p"
+    t_tag = f"{_W}t"
+    while stack:
+        node = stack.pop()
+        if node.tag == p_tag:
+            # Nested paragraph (e.g. inside a drawing text box) will be visited on its own.
+            continue
+        if node.tag == t_tag:
+            parts.append(node.text or "")
+        elif node.tag in (f"{_W}br", f"{_W}cr", f"{_A}br"):
+            parts.append("\n")
+        elif node.tag == f"{_W}tab":
+            parts.append(" ")
+        else:
+            children = list(node)
+            if children:
+                stack.extend(reversed(children))
+    return "".join(parts)
+
+
 def extract_docx_text(data: bytes) -> DocumentText:
     """Reads a Word document paragraph by paragraph.
 
@@ -110,7 +177,7 @@ def extract_docx_text(data: bytes) -> DocumentText:
     document = DocumentText()
     with _open_package(data, "Word") as archive:
         try:
-            body = archive.read("word/document.xml")
+            body = _safe_read_zip_member(archive, "word/document.xml", what="Word")
         except KeyError as exc:
             raise PdfTextError("That Word file has no readable document body.") from exc
 
@@ -121,7 +188,7 @@ def extract_docx_text(data: bytes) -> DocumentText:
 
     lines: list[str] = []
     for paragraph in root.iter(f"{_W}p"):
-        text = _element_text(paragraph, f"{_W}t").strip()
+        text = _paragraph_own_text(paragraph).strip()
         if text:
             lines.append(text)
         elif lines and lines[-1] != "":
@@ -129,7 +196,7 @@ def extract_docx_text(data: bytes) -> DocumentText:
             # chunker later splits on.
             lines.append("")
 
-    joined = clean_page_text("\n".join(lines))[:MAX_EXTRACTED_CHARS]
+    joined = clean_page_text("\n".join(lines), strip_page_numbers=False)[:MAX_EXTRACTED_CHARS]
     document.total_pages = 1
     document.pages_read = 1
     document.pages.append(PageText(number=1, text=joined))
@@ -138,7 +205,7 @@ def extract_docx_text(data: bytes) -> DocumentText:
     return document
 
 
-def extract_pptx_text(data: bytes) -> DocumentText:
+def extract_pptx_text(data: bytes, *, max_pages: int = MAX_PPTX_SLIDES_DEFAULT) -> DocumentText:
     """Reads a PowerPoint deck slide by slide, in slide order."""
     document = DocumentText()
     with _open_package(data, "PowerPoint") as archive:
@@ -151,27 +218,65 @@ def extract_pptx_text(data: bytes) -> DocumentText:
             raise PdfTextError("That PowerPoint file has no slides.")
 
         # namelist() order is arbitrary, and slide10 sorts before slide2.
-        slides.sort(key=lambda name: int(_SLIDE_NUMBER.search(name).group(1))
-                    if _SLIDE_NUMBER.search(name) else 0)
+        slides.sort(
+            key=lambda name: int(_SLIDE_NUMBER.search(name).group(1))
+            if _SLIDE_NUMBER.search(name)
+            else 0
+        )
         document.total_pages = len(slides)
+        if len(slides) > max_pages:
+            document.warnings.append(
+                f"Only the first {max_pages} of {len(slides)} slides were read."
+            )
+            slides = slides[:max_pages]
 
         total = 0
+        decompressed_total = 0
         for index, name in enumerate(slides, start=1):
+            remaining_bytes = MAX_ZIP_TOTAL_BYTES - decompressed_total
+            if remaining_bytes <= 0:
+                document.warnings.append(
+                    f"The deck was too large, so only its first {index - 1} slides were read."
+                )
+                break
             try:
-                root = ElementTree.fromstring(archive.read(name))
+                raw_slide = _safe_read_zip_member(
+                    archive,
+                    name,
+                    what="PowerPoint",
+                    max_bytes=min(MAX_ZIP_MEMBER_BYTES, remaining_bytes),
+                )
+                decompressed_total += len(raw_slide)
+                root = ElementTree.fromstring(raw_slide)
             except (ElementTree.ParseError, KeyError):
                 logger.warning("Slide %s could not be read", name)
                 continue
-            pieces = [
-                (node.text or "").strip()
-                for node in root.iter(f"{_A}t")
-                if (node.text or "").strip()
-            ]
-            text = clean_page_text("\n".join(pieces))
+            paragraphs = list(root.iter(f"{_A}p"))
+            if paragraphs:
+                pieces = [
+                    _element_text(p, f"{_A}t").strip()
+                    for p in paragraphs
+                    if _element_text(p, f"{_A}t").strip()
+                ]
+            else:
+                pieces = [
+                    (node.text or "").strip()
+                    for node in root.iter(f"{_A}t")
+                    if (node.text or "").strip()
+                ]
+            text = clean_page_text("\n".join(pieces), strip_page_numbers=False)
             if total + len(text) > MAX_EXTRACTED_CHARS:
-                document.warnings.append(
-                    f"The deck was long, so only its first {index - 1} slides were read."
-                )
+                if total == 0:
+                    # Slide 1 alone exceeds the ceiling: truncate instead of failing as image-only.
+                    text = text[:MAX_EXTRACTED_CHARS]
+                    document.pages.append(PageText(number=index, text=text))
+                    document.warnings.append(
+                        "Slide 1 was very long, so its text was shortened."
+                    )
+                else:
+                    document.warnings.append(
+                        f"The deck was long, so only its first {index - 1} slides were read."
+                    )
                 break
             total += len(text)
             document.pages.append(PageText(number=index, text=text))
@@ -208,4 +313,4 @@ def extract_document_text(
         return extract_pdf_text(data, max_pages=max_pages, allow_ocr=allow_ocr), kind
     if kind == "docx":
         return extract_docx_text(data), kind
-    return extract_pptx_text(data), kind
+    return extract_pptx_text(data, max_pages=max_pages), kind

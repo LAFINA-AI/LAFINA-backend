@@ -273,7 +273,10 @@ async def _pro_headers(async_client: AsyncClient, email: str) -> dict[str, str]:
 
 
 @pytest.mark.asyncio
-async def test_study_notes_need_a_pro_subscription(async_client: AsyncClient):
+async def test_study_notes_require_active_account_and_allow_students(async_client: AsyncClient):
+    from app.api.v1.ai import get_deepseek_client
+    from app.main import app
+
     payload = {
         "filename": "notes.pptx",
         "contentBase64": base64.b64encode(build_pptx([["A slide."]])).decode(),
@@ -286,9 +289,13 @@ async def test_study_notes_need_a_pro_subscription(async_client: AsyncClient):
         "/v1/auth/register", json={"email": "sn_student@ustp.edu.ph", "password": password}
     )
     headers = {"Authorization": f"Bearer {reg.json()['access_token']}"}
-    res = await async_client.post("/v1/ai/study-notes", headers=headers, json=payload)
-    assert res.status_code == 403
-    assert "student_pro" in res.json()["detail"]
+    fake = FakeDeepSeek(replies=[SUMMARY_REPLY])
+    app.dependency_overrides[get_deepseek_client] = lambda: fake
+    try:
+        res = await async_client.post("/v1/ai/study-notes", headers=headers, json=payload)
+        assert res.status_code == 200, res.text
+    finally:
+        app.dependency_overrides.pop(get_deepseek_client, None)
 
 
 @pytest.mark.asyncio

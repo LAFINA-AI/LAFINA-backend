@@ -1,4 +1,5 @@
 import json
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Annotated, Literal
@@ -11,7 +12,7 @@ from pydantic import (
     field_validator,
     model_validator,
 )
-from sqlalchemy import delete, func, select, text
+from sqlalchemy import delete, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
@@ -31,17 +32,21 @@ from app.security.auth import get_current_user_and_session
 
 router = APIRouter(prefix="/v1/sync", tags=["sync"])
 
+MAX_INT64 = (1 << 63) - 1
+AVATAR_SEED_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+
 # Strict typed entity payloads forbidding unknown/untrusted fields (extra="forbid")
 class TaskPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
     title: str = Field(..., max_length=256)
-    due_date: str | None = None
-    due_time: str | None = None
+    due_date: str | None = Field(None, max_length=64)
+    due_time: str | None = Field(None, max_length=64)
     is_completed: bool = False
     priority: Literal["High", "Medium", "Low"] = "Medium"
     category: str = Field("General", max_length=64)
-    notes: str | None = None
-    recurrence_rule: str | None = None
+    notes: str | None = Field(None, max_length=20_000)
+    recurrence_rule: str | None = Field(None, max_length=512)
 
     @field_validator("priority", mode="before")
     @classmethod
@@ -62,42 +67,42 @@ class TaskPayload(BaseModel):
 class EventPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
     title: str = Field(..., max_length=256)
-    date: str
-    start_time: str
-    end_time: str
-    location: str | None = None
-    linked_calendar_block: str | None = None
-    recurrence_rule: str | None = None
+    date: str = Field(..., max_length=64)
+    start_time: str = Field(..., max_length=64)
+    end_time: str = Field(..., max_length=64)
+    location: str | None = Field(None, max_length=512)
+    linked_calendar_block: str | None = Field(None, max_length=128)
+    recurrence_rule: str | None = Field(None, max_length=512)
 
 class TimeBlockPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
     title: str = Field(..., max_length=256)
-    date: str
-    start_time: str
-    end_time: str
-    color: str
-    category: str
-    notes: str | None = None
-    recurrence_rule: str | None = None
+    date: str = Field(..., max_length=64)
+    start_time: str = Field(..., max_length=64)
+    end_time: str = Field(..., max_length=64)
+    color: str = Field(..., max_length=64)
+    category: str = Field(..., max_length=64)
+    notes: str | None = Field(None, max_length=20_000)
+    recurrence_rule: str | None = Field(None, max_length=512)
 
 class ReminderPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
     task: str = Field(..., max_length=256)
-    description: str | None = None
-    scheduled_at: str
-    trigger_at: str
-    status: str = "pending"
-    snooze_count: int = 0
+    description: str | None = Field(None, max_length=10_000)
+    scheduled_at: str = Field(..., max_length=64)
+    trigger_at: str = Field(..., max_length=64)
+    status: str = Field("pending", max_length=64)
+    snooze_count: int = Field(0, ge=0, le=10_000)
 
 class NotePayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
     title: str = Field(..., max_length=256)
-    body: str
+    body: str = Field(..., max_length=200_000)
     is_pinned: bool = False
-    tags: str = "[]"
-    category: str = "General"
+    tags: str = Field("[]", max_length=4096)
+    category: str = Field("General", max_length=64)
     is_voice_transcribed: bool = False
-    sort_order: int = 0
+    sort_order: int = Field(0, ge=-1_000_000, le=1_000_000)
 
     @field_validator("tags")
     @classmethod
@@ -121,17 +126,32 @@ class CustomCategoryPayload(BaseModel):
 class ProfilePayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
     username: str = Field(..., max_length=128)
-    wake_time: str = "07:00"
-    sleep_time: str = "23:00"
-    study_peak_hours: str = "[]"
-    busiest_day: str = "Monday"
-    reminder_lead_minutes: int = 15
-    snooze_tendency: str = "snooze_once"
-    weekly_class_count: str = "4-6"
-    longest_class_gap: str = "1 hour"
+    wake_time: str = Field("07:00", max_length=32)
+    sleep_time: str = Field("23:00", max_length=32)
+    study_peak_hours: str = Field("[]", max_length=1024)
+    busiest_day: str = Field("Monday", max_length=32)
+    reminder_lead_minutes: int = Field(15, ge=0, le=10_080)
+    snooze_tendency: str = Field("snooze_once", max_length=64)
+    weekly_class_count: str = Field("4-6", max_length=64)
+    longest_class_gap: str = Field("1 hour", max_length=64)
     time_format_24h: bool = False
     week_starts_monday: bool = False
     dark_mode: bool = False
+    avatar_seed: str | None = Field(None, max_length=128)
+
+    @field_validator("avatar_seed")
+    @classmethod
+    def validate_avatar_seed(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        clean = value.strip()
+        if not clean:
+            return None
+        if ".." in clean or not AVATAR_SEED_RE.match(clean):
+            raise ValueError(
+                "avatar_seed must be an opaque character seed token (never a path, URL, or image data)"
+            )
+        return clean
 
 # Study tools. Caps keep a single mutation far below the 1 MiB request limit
 # while leaving room above what the generators produce and editors allow.
@@ -175,8 +195,8 @@ class FlashcardDeckPayload(BaseModel):
     title: str = Field(..., max_length=160)
     source_name: str | None = Field(None, max_length=255)
     cards: list[FlashcardPayloadCard] = Field(default_factory=list, max_length=200)
-    page_count: int = Field(0, ge=0)
-    ocr_page_count: int = Field(0, ge=0)
+    page_count: int = Field(0, ge=0, le=100_000)
+    ocr_page_count: int = Field(0, ge=0, le=100_000)
     warnings: list[ShortText] = Field(default_factory=list, max_length=50)
     created_at: str = Field(..., max_length=64)
 
@@ -202,16 +222,22 @@ class StudySummaryPayload(BaseModel):
     sections: list[StudyNoteSectionPayload] = Field(default_factory=list, max_length=60)
     key_terms: list[StudyNoteTermPayload] = Field(default_factory=list, max_length=100)
     markdown: str = Field("", max_length=200_000)
-    page_count: int = Field(0, ge=0)
+    page_count: int = Field(0, ge=0, le=100_000)
     warnings: list[ShortText] = Field(default_factory=list, max_length=50)
     created_at: str = Field(..., max_length=64)
 
 
 class MeetingTranscriptSegmentPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    start_ms: int = Field(..., ge=0)
-    end_ms: int = Field(..., ge=0)
+    start_ms: int = Field(..., ge=0, le=MAX_INT64)
+    end_ms: int = Field(..., ge=0, le=MAX_INT64)
     text: str = Field(..., max_length=10_000)
+
+    @model_validator(mode="after")
+    def require_valid_range(self) -> "MeetingTranscriptSegmentPayload":
+        if self.end_ms < self.start_ms:
+            raise ValueError("end_ms must be >= start_ms")
+        return self
 
 
 class MeetingKeyTopicPayload(BaseModel):
@@ -249,7 +275,7 @@ class RecordedMeetingPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
     title: str = Field(..., max_length=200)
     started_at: str = Field(..., max_length=64)
-    duration_seconds: float = Field(0, ge=0)
+    duration_seconds: float = Field(0, ge=0, le=86_400, allow_inf_nan=False)
     source: Literal["recording", "upload"] = "recording"
     language: str | None = Field(None, max_length=16)
     status: Literal["transcription_complete", "completed"]
@@ -276,6 +302,7 @@ USTP_CHAT_PREFIX = "chat_session:ustp_"
 # An account keeps at most this many chats. A write that would add one more
 # is rejected with CHAT_LIMIT_REASON; the phone keeps that chat locally.
 MAX_CHAT_SESSIONS_PER_ACCOUNT = 20
+MAX_CHAT_MESSAGES_PER_ACCOUNT = 5_000
 CHAT_LIMIT_REASON = "chat_limit_reached"
 
 
@@ -290,10 +317,18 @@ class ChatSessionPayload(BaseModel):
 class ChatAttachmentPayload(BaseModel):
     """What a file was, never where it is: the file stays on its phone."""
     model_config = ConfigDict(extra="forbid")
-    file_name: str = Field(..., max_length=255)
+    file_name: str = Field(..., min_length=1, max_length=255)
     format: str = Field("", max_length=32)
     mime_type: str = Field("", max_length=128)
-    size_bytes: int = Field(0, ge=0)
+    size_bytes: int = Field(0, ge=0, le=100_000_000)
+
+    @field_validator("file_name")
+    @classmethod
+    def sanitize_file_name(cls, value: str) -> str:
+        clean = _CONTROL_CHARS_RE.sub("", value).strip()
+        if not clean or "/" in clean or "\\" in clean or ".." in clean:
+            raise ValueError("file_name must be a plain filename without path separators")
+        return clean
 
 
 class ChatReviewResolutionPayload(BaseModel):
@@ -340,12 +375,12 @@ CHAT_ENTITY_TYPES: frozenset[str] = frozenset({"chat_session", "chat_message"})
 CHAT_SCRUB_CHUNK = 500
 
 class SyncMutation(BaseModel):
-    mutationId: str = Field(..., max_length=128)
+    mutationId: str = Field(..., min_length=1, max_length=128)
     entityType: EntityType
-    entityId: str = Field(..., max_length=128)
+    entityId: str = Field(..., min_length=1, max_length=128)
     operation: OperationType
     clientUpdatedAt: datetime
-    baseVersion: int | None = Field(default=None, ge=0)
+    baseVersion: int | None = Field(default=None, ge=0, le=MAX_INT64)
     payload: dict
 
     @field_validator("clientUpdatedAt")
@@ -363,7 +398,7 @@ class SnapshotPosition(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     entityType: EntityType
-    entityId: str = Field(..., max_length=128)
+    entityId: str = Field(..., min_length=1, max_length=128)
 
 
 class SnapshotRequest(BaseModel):
@@ -371,7 +406,7 @@ class SnapshotRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    boundaryCursor: int | None = Field(default=None, ge=0)
+    boundaryCursor: int | None = Field(default=None, ge=0, le=MAX_INT64)
     after: SnapshotPosition | None = None
 
     @model_validator(mode="after")
@@ -384,7 +419,7 @@ class SnapshotRequest(BaseModel):
 
 class SyncBatchRequest(BaseModel):
     mutations: list[SyncMutation] = Field(default_factory=list, max_length=100)
-    cursor: int = Field(default=0, ge=0)
+    cursor: int = Field(default=0, ge=0, le=MAX_INT64)
     snapshot: SnapshotRequest | None = None
     # Entity types the client can apply. Absent means a pre-negotiation client
     # (LEGACY_ENTITY_TYPES). Unknown names are ignored rather than rejected so
@@ -698,10 +733,29 @@ async def _build_snapshot_page(
         if rank < after_rank or entity_type not in declared_types:
             continue
 
-        conditions = [
-            model_cls.owner_id == owner_id,
-            model_cls.change_id <= boundary,
-        ]
+        if boundary < current_boundary:
+            # Include existing rows that were concurrently updated past `boundary`
+            # so a multi-page authoritative snapshot never drops live rows and causes
+            # the client to prune them; brand-new rows created after `boundary` stay deltas.
+            existed_at_boundary = (
+                select(ChangeFeed.change_id)
+                .where(
+                    ChangeFeed.owner_id == owner_id,
+                    ChangeFeed.entity_type == entity_type,
+                    ChangeFeed.entity_id == model_cls.client_id,
+                    ChangeFeed.change_id <= boundary,
+                )
+                .exists()
+            )
+            conditions = [
+                model_cls.owner_id == owner_id,
+                or_(model_cls.change_id <= boundary, existed_at_boundary),
+            ]
+        else:
+            conditions = [
+                model_cls.owner_id == owner_id,
+                model_cls.change_id <= boundary,
+            ]
         if rank == after_rank and after_id is not None:
             conditions.append(model_cls.client_id > after_id)
 
@@ -815,6 +869,34 @@ def _chat_session_kind(session_id: str) -> Literal["general", "ustp"]:
     return "ustp" if session_id.startswith(USTP_CHAT_PREFIX) else "general"
 
 
+async def _scrub_idempotent_chat_payloads(
+    db: AsyncSession,
+    owner_id: uuid.UUID,
+    entity_type: str,
+    entity_ids: set[str],
+) -> None:
+    """Clear any chat text cached inside `idempotent_mutations.response_payload`."""
+    if not entity_ids:
+        return
+    rows = (
+        await db.execute(
+            select(IdempotentMutation).where(
+                IdempotentMutation.owner_id == owner_id,
+                IdempotentMutation.status == "rejected",
+            )
+        )
+    ).scalars().all()
+    for rec in rows:
+        payload = rec.response_payload
+        if (
+            isinstance(payload, dict)
+            and payload.get("entityType") == entity_type
+            and payload.get("entityId") in entity_ids
+            and payload.get("serverPayload")
+        ):
+            rec.response_payload = {**payload, "serverPayload": {}}
+
+
 async def _scrub_superseded_chat_changes(
     db: AsyncSession,
     owner_id: uuid.UUID,
@@ -822,12 +904,7 @@ async def _scrub_superseded_chat_changes(
     entity_ids: list[str],
     before_change_id: int,
 ) -> None:
-    """Drop the change feed's older copies of deleted chat rows.
-
-    Deleted chat text should not stay on the server. Each row's delete change
-    is kept, so a client behind the cursor still learns of the delete; only the
-    superseded changes that carried the old text are removed.
-    """
+    """Drop the change feed's older copies and any cached conflict text for deleted chat rows."""
     for start in range(0, len(entity_ids), CHAT_SCRUB_CHUNK):
         chunk = entity_ids[start:start + CHAT_SCRUB_CHUNK]
         await db.execute(
@@ -838,6 +915,7 @@ async def _scrub_superseded_chat_changes(
                 ChangeFeed.change_id < before_change_id,
             )
         )
+    await _scrub_idempotent_chat_payloads(db, owner_id, entity_type, set(entity_ids))
 
 
 async def _tombstone_chat_rows(
@@ -847,40 +925,44 @@ async def _tombstone_chat_rows(
     rows: list,
     now: datetime,
 ) -> int:
-    """Delete live chat rows in bulk: one delete change each, text cleared."""
+    """Delete live chat rows in bounded chunks: one delete change each, text cleared."""
     if not rows:
         return 0
-    records = [
-        ChangeFeed(
-            owner_id=owner_id,
-            entity_type=entity_type,
-            entity_id=row.client_id,
-            operation="delete",
-            version=row.version + 1,
-            payload={},
-            created_at=now,
+    total_deleted = 0
+    for start in range(0, len(rows), CHAT_SCRUB_CHUNK):
+        batch = rows[start : start + CHAT_SCRUB_CHUNK]
+        records = [
+            ChangeFeed(
+                owner_id=owner_id,
+                entity_type=entity_type,
+                entity_id=row.client_id,
+                operation="delete",
+                version=row.version + 1,
+                payload={},
+                created_at=now,
+            )
+            for row in batch
+        ]
+        db.add_all(records)
+        await db.flush()
+        for row, record in zip(batch, records):
+            row.version = record.version
+            row.change_id = record.change_id
+            row.payload = {}
+            row.updated_at = now
+            row.deleted_at = now
+        change_ids = [record.change_id for record in records]
+        await _advance_sync_head(db, owner_id, max(change_ids), now)
+        await _scrub_superseded_chat_changes(
+            db,
+            owner_id,
+            entity_type,
+            [row.client_id for row in batch],
+            min(change_ids),
         )
-        for row in rows
-    ]
-    db.add_all(records)
-    await db.flush()
-    for row, record in zip(rows, records):
-        row.version = record.version
-        row.change_id = record.change_id
-        row.payload = {}
-        row.updated_at = now
-        row.deleted_at = now
-    change_ids = [record.change_id for record in records]
-    await _advance_sync_head(db, owner_id, max(change_ids), now)
-    await _scrub_superseded_chat_changes(
-        db,
-        owner_id,
-        entity_type,
-        [row.client_id for row in rows],
-        min(change_ids),
-    )
-    await db.flush()
-    return len(rows)
+        await db.flush()
+        total_deleted += len(batch)
+    return total_deleted
 
 
 async def _live_chat_messages(
@@ -1028,7 +1110,7 @@ def _restore_idempotent_result(
         "rejected" if stored_status == "rejected" else "accepted"
     )
     reason = stored.get("reason")
-    if result_status == "accepted":
+    if result_status == "accepted" and reason != "already_deleted":
         reason = "idempotent_duplicate"
 
     server_version = stored.get("serverVersion")
@@ -1078,13 +1160,18 @@ async def sync_batch(
     now_str = now.isoformat()
     declared_types = _resolve_declared_entity_types(req.entityTypes)
 
-    if len(req.mutations) > 100:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Batch exceeds maximum of 100 mutations.")
-
     accepted_results: list[MutationResult] = []
     rejected_results: list[MutationResult] = []
 
     await _lock_batch_mutations(db, owner_id, req.mutations)
+
+    # Check ahead-of-server / pruned cursors BEFORE applying pushed mutations so
+    # new writes cannot advance `boundary` past a stale ahead-of-server cursor.
+    pre_push_reset_required = (
+        await _cursor_requires_snapshot(db, owner_id, req.cursor)
+        if req.snapshot is None and req.cursor > 0
+        else False
+    )
 
     for mut in req.mutations:
         idempotent_stmt = select(IdempotentMutation).where(
@@ -1169,24 +1256,41 @@ async def sync_batch(
         entity_res = await db.execute(entity_stmt)
         existing_entity = entity_res.scalar_one_or_none()
 
-        server_version = existing_entity.version if existing_entity else 0
-        if mut.baseVersion is not None and mut.baseVersion != server_version:
-            conflict_result = MutationResult(
-                mutationId=mut.mutationId,
-                entityType=mut.entityType,
-                entityId=mut.entityId,
-                status="rejected",
-                reason="version_conflict",
-                serverVersion=server_version,
-                serverPayload=existing_entity.payload if existing_entity else {},
-            )
-            await _record_terminal_result(db, owner_id, mut, conflict_result)
-            rejected_results.append(conflict_result)
-            continue
+        # Preserve existing character avatar_seed when an older app build omits the field.
+        if (
+            mut.entityType == "profile"
+            and mut.operation != "delete"
+            and "avatar_seed" not in mut.payload
+            and existing_entity is not None
+            and isinstance(existing_entity.payload, dict)
+            and "avatar_seed" in existing_entity.payload
+        ):
+            validated_payload["avatar_seed"] = existing_entity.payload["avatar_seed"]
+
+        # Enforce at most one row per owner for singleton entity types (profile, pomodoro_settings).
+        if mut.entityType in SINGLETON_ENTITY_TYPES and existing_entity is None:
+            other_singleton = (
+                await db.execute(
+                    select(model_cls.client_id)
+                    .where(model_cls.owner_id == owner_id)
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if other_singleton is not None and other_singleton != mut.entityId:
+                singleton_result = MutationResult(
+                    mutationId=mut.mutationId,
+                    entityType=mut.entityType,
+                    entityId=mut.entityId,
+                    status="rejected",
+                    reason=f"{mut.entityType}_singleton_conflict",
+                )
+                await _record_terminal_result(db, owner_id, mut, singleton_result)
+                rejected_results.append(singleton_result)
+                continue
 
         # A chat edit or delete that reaches a row already deleted (on another
-        # phone) changes nothing: the delete wins. A `create` still restores
-        # it, which is how a phone re-uploads its own history.
+        # phone) changes nothing: the delete wins — evaluated BEFORE baseVersion
+        # conflict checks so offline clients with stale baseVersion still converge.
         if (
             mut.entityType in CHAT_ENTITY_TYPES
             and mut.operation != "create"
@@ -1207,6 +1311,26 @@ async def sync_batch(
             accepted_results.append(already_deleted_result)
             continue
 
+        server_version = existing_entity.version if existing_entity else 0
+        if mut.baseVersion is not None and mut.baseVersion != server_version:
+            conflict_payload = (
+                {}
+                if existing_entity is None or existing_entity.deleted_at is not None
+                else existing_entity.payload
+            )
+            conflict_result = MutationResult(
+                mutationId=mut.mutationId,
+                entityType=mut.entityType,
+                entityId=mut.entityId,
+                status="rejected",
+                reason="version_conflict",
+                serverVersion=server_version,
+                serverPayload=conflict_payload,
+            )
+            await _record_terminal_result(db, owner_id, mut, conflict_result)
+            rejected_results.append(conflict_result)
+            continue
+
         if mut.entityType in CHAT_ENTITY_TYPES and await _chat_limit_reached(
             db, owner_id, mut, existing_entity
         ):
@@ -1222,6 +1346,36 @@ async def sync_batch(
             rejected_results.append(limit_result)
             continue
 
+        if (
+            mut.entityType == "chat_message"
+            and mut.operation != "delete"
+            and (existing_entity is None or existing_entity.deleted_at is not None)
+        ):
+            live_msg_count = int(
+                (
+                    await db.execute(
+                        select(func.count())
+                        .select_from(ChatMessagesSync)
+                        .where(
+                            ChatMessagesSync.owner_id == owner_id,
+                            ChatMessagesSync.deleted_at.is_(None),
+                        )
+                    )
+                ).scalar_one()
+            )
+            if live_msg_count >= MAX_CHAT_MESSAGES_PER_ACCOUNT:
+                msg_limit_result = MutationResult(
+                    mutationId=mut.mutationId,
+                    entityType=mut.entityType,
+                    entityId=mut.entityId,
+                    status="rejected",
+                    reason="chat_message_limit_reached",
+                    serverVersion=server_version,
+                )
+                await _record_terminal_result(db, owner_id, mut, msg_limit_result)
+                rejected_results.append(msg_limit_result)
+                continue
+
         # Deleting a chat deletes its messages first, so the feed removes the
         # text before the chat that held it.
         if mut.entityType == "chat_session" and mut.operation == "delete":
@@ -1231,6 +1385,17 @@ async def sync_batch(
                 owner_id,
                 "chat_message",
                 await _live_chat_messages(db, owner_id, mut.entityId),
+                now,
+            )
+
+        # Ensure parent chat_session exists BEFORE inserting the chat_message's
+        # ChangeFeed row so change_id ordering always delivers the session first.
+        if mut.entityType == "chat_message" and mut.operation != "delete":
+            await _ensure_chat_session(
+                db,
+                owner_id,
+                validated_payload["session_id"],
+                validated_payload["created_at"],
                 now,
             )
 
@@ -1254,6 +1419,7 @@ async def sync_batch(
             deleted_at_val = now
             if existing_entity:
                 existing_entity.deleted_at = deleted_at_val
+                existing_entity.payload = {}
                 existing_entity.version = new_version
                 existing_entity.change_id = new_change_id
                 existing_entity.updated_at = now
@@ -1285,22 +1451,11 @@ async def sync_batch(
                     deleted_at=None
                 ))
 
-        if mut.entityType in CHAT_ENTITY_TYPES:
-            if mut.operation == "delete":
-                if existing_entity:
-                    existing_entity.payload = {}
-                await db.flush()
-                await _scrub_superseded_chat_changes(
-                    db, owner_id, mut.entityType, [mut.entityId], new_change_id
-                )
-            elif mut.entityType == "chat_message":
-                await _ensure_chat_session(
-                    db,
-                    owner_id,
-                    validated_payload["session_id"],
-                    validated_payload["created_at"],
-                    now,
-                )
+        if mut.entityType in CHAT_ENTITY_TYPES and mut.operation == "delete":
+            await db.flush()
+            await _scrub_superseded_chat_changes(
+                db, owner_id, mut.entityType, [mut.entityId], new_change_id
+            )
 
         accepted_result = MutationResult(
             mutationId=mut.mutationId,
@@ -1336,7 +1491,7 @@ async def sync_batch(
             supportedEntityTypes=SUPPORTED_ENTITY_TYPES,
         )
 
-    reset_required = await _cursor_requires_snapshot(
+    reset_required = pre_push_reset_required or await _cursor_requires_snapshot(
         db,
         owner_id,
         req.cursor,
@@ -1434,6 +1589,23 @@ async def purge_chat_history(
     deleted_sessions = await _tombstone_chat_rows(
         db, owner_id, "chat_session", list(session_result.scalars().all()), now
     )
+    # Also scrub any residual conflict payloads cached for chat entities (even already-deleted ones).
+    residual_rows = (
+        await db.execute(
+            select(IdempotentMutation).where(
+                IdempotentMutation.owner_id == owner_id,
+                IdempotentMutation.status == "rejected",
+            )
+        )
+    ).scalars().all()
+    for rec in residual_rows:
+        payload = rec.response_payload
+        if (
+            isinstance(payload, dict)
+            and payload.get("entityType") in CHAT_ENTITY_TYPES
+            and payload.get("serverPayload")
+        ):
+            rec.response_payload = {**payload, "serverPayload": {}}
     return ChatPurgeResponse(
         deletedSessions=deleted_sessions,
         deletedMessages=deleted_messages,

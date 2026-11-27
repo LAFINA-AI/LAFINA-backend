@@ -79,8 +79,8 @@ def test_c01_admin_session_secret_is_not_pem_prefix():
     assert explicit.get_admin_session_secret() == "s" * 40
 
 
-def test_h05_production_rejects_placeholder_and_invalid_jwt_keys():
-    """H-05: Production rejects placeholder keys and invalid JWT PEM keys; missing keys temporarily fall back."""
+def test_h05_production_rejects_placeholder_and_missing_jwt_keys():
+    """H-05: Production must reject .env.example placeholder keys and missing JWT PEM keys."""
     with pytest.raises(ValueError, match="DEEPSEEK_API_KEY"):
         Settings(
             ENVIRONMENT="production",
@@ -91,19 +91,9 @@ def test_h05_production_rejects_placeholder_and_invalid_jwt_keys():
         Settings(
             ENVIRONMENT="production",
             DEEPSEEK_API_KEY="sk-live-real-looking-key-1234567890",
-            JWT_PRIVATE_KEY="not-a-valid-pem",
-            JWT_PUBLIC_KEY="not-a-valid-pem",
+            JWT_PRIVATE_KEY="",
+            JWT_PUBLIC_KEY="",
         )
-
-    # Temporary hotfix while Vercel Production env vars are pending provisioning.
-    fallback = Settings(
-        ENVIRONMENT="production",
-        DEEPSEEK_API_KEY="sk-live-real-looking-key-1234567890",
-        JWT_PRIVATE_KEY="",
-        JWT_PUBLIC_KEY="",
-    )
-    assert fallback.JWT_PRIVATE_KEY.startswith("-----BEGIN PRIVATE KEY-----")
-    assert fallback.JWT_PUBLIC_KEY.startswith("-----BEGIN PUBLIC KEY-----")
 
 
 @pytest.mark.asyncio

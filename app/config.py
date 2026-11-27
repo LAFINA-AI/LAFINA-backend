@@ -1,6 +1,5 @@
 import functools
 import hashlib
-import logging
 import os
 from typing import Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -9,8 +8,6 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from pydantic import SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
-logger = logging.getLogger(__name__)
 
 
 # Generate default RSA key pair lazily for development/testing if not provided via env
@@ -390,15 +387,12 @@ class Settings(BaseSettings):
         pub = (self.JWT_PUBLIC_KEY or "").strip().replace("\\n", "\n")
         if not priv or not pub:
             if self.ENVIRONMENT == "production":
-                # Temporary hotfix until JWT_PRIVATE_KEY and JWT_PUBLIC_KEY are added
-                # in Vercel Production environment variables.
-                logger.warning(
-                    "JWT_PRIVATE_KEY and/or JWT_PUBLIC_KEY not configured in production; "
-                    "falling back to an ephemeral RSA keypair until Vercel env vars are set."
+                raise ValueError(
+                    "JWT_PRIVATE_KEY and JWT_PUBLIC_KEY environment variables must be explicitly configured in production."
                 )
             dev_priv, dev_pub = _get_dev_rsa_pair()
-            priv = dev_priv
-            pub = dev_pub
+            priv = priv or dev_priv
+            pub = pub or dev_pub
         else:
             if self.ENVIRONMENT == "production":
                 try:
